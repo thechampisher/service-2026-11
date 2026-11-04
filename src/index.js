@@ -877,6 +877,44 @@ async function handleAdmin(request, env, path, method) {
     }, 201);
   }
 
+
+  // MEMBER_DELETE_ROUTE_V1
+  const memberDelete = path.match(/^\/admin\/members\/([^/]+)\/delete$/);
+
+  if (method === "POST" && memberDelete) {
+    const id = memberDelete[1];
+
+    const member = await env.DB.prepare(
+      "SELECT id FROM members WHERE id = ? LIMIT 1"
+    ).bind(id).first();
+
+    if (!member) {
+      return json({ ok: false, error: "Member not found" }, 404);
+    }
+
+    await audit(env, "member_deleted", id);
+
+    await env.DB.batch([
+      env.DB.prepare(
+        "DELETE FROM playback_sessions WHERE member_id = ?"
+      ).bind(id),
+      env.DB.prepare(
+        "DELETE FROM broadcast_recipients WHERE member_id = ?"
+      ).bind(id),
+      env.DB.prepare(
+        "DELETE FROM messages WHERE member_id = ?"
+      ).bind(id),
+      env.DB.prepare(
+        "DELETE FROM devices WHERE member_id = ?"
+      ).bind(id),
+      env.DB.prepare(
+        "DELETE FROM members WHERE id = ?"
+      ).bind(id)
+    ]);
+
+    return json({ ok: true, deleted: true });
+  }
+
   const memberStatus = path.match(/^\/admin\/members\/([^/]+)\/status$/);
 
   if (method === "PATCH" && memberStatus) {
