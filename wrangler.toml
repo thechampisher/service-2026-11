@@ -1,0 +1,12 @@
+name = "stream-access-service"
+main = "src/index.js"
+compatibility_date = "2026-11-02"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "isa-admin-prod-db"
+database_id = "36c92973-5128-4cf0-8420-736a607a65b8"
+migrations_dir = "migrations"
+
+[vars]
+PLAYBACK_TICKET_TTL = "1800"

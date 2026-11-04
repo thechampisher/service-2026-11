@@ -1,0 +1,930 @@
+const cors = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  "Access-Control-Allow-Methods": "GET, POST, PATCH, OPTIONS",
+  "Cache-Control": "no-store"
+};
+
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      ...cors,
+      "Content-Type": "application/json; charset=utf-8"
+    }
+  });
+}
+
+const uuid = () => crypto.randomUUID();
+
+async function readJson(request) {
+  try {
+    return await request.json();
+  } catch {
+    return null;
+  }
+}
+
+function b64url(bytes) {
+  let binary = "";
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary)
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replaceAll("=", "");
+}
+
+function unb64url(value) {
+  const s = value.replaceAll("-", "+").replaceAll("_", "/");
+  const binary = atob(s + "=".repeat((4 - s.length % 4) % 4));
+  return Uint8Array.from(binary, c => c.charCodeAt(0));
+}
+
+function equalText(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+
+  let diff = a.length ^ b.length;
+  const n = Math.max(a.length, b.length);
+
+  for (let i = 0; i < n; i++) {
+    diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
+  }
+
+  return diff === 0;
+}
+
+async function sha256(value) {
+  const result = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(value)
+  );
+
+  return b64url(new Uint8Array(result));
+}
+
+async function importSigningKey(env) {
+  if (!env.TOKEN_SIGNING_SECRET) {
+    throw new Error("TOKEN_SIGNING_SECRET missing");
+  }
+
+  return crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(env.TOKEN_SIGNING_SECRET),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign", "verify"]
+  );
+}
+
+async function createToken(payload, env) {
+  const header = b64url(
+    new TextEncoder().encode(JSON.stringify({
+      alg: "HS256",
+      typ: "JWT"
+    }))
+  );
+
+  const body = b64url(
+    new TextEncoder().encode(JSON.stringify(payload))
+  );
+
+  const input = header + "." + body;
+  const key = await importSigningKey(env);
+
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(input)
+  );
+
+  return input + "." + b64url(new Uint8Array(signature));
+}
+
+async function verifyToken(token, env) {
+  try {
+    if (typeof token !== "string" || token.length > 8192) return null;
+
+    const parts = token.split(".");
+    if (parts.length !== 3) return null;
+
+    const key = await importSigningKey(env);
+
+    const valid = await crypto.subtle.verify(
+      "HMAC",
+      key,
+      unb64url(parts[2]),
+      new TextEncoder().encode(parts[0] + "." + parts[1])
+    );
+
+    if (!valid) return null;
+
+    const payload = JSON.parse(
+      new TextDecoder().decode(unb64url(parts[1]))
+    );
+
+    if (!payload.exp || payload.exp <= Math.floor(Date.now() / 1000)) {
+      return null;
+    }
+
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+function bearer(request) {
+  const value = request.headers.get("Authorization") || "";
+  return value.startsWith("Bearer ") ? value.slice(7) : "";
+}
+
+async function hashPassword(password) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(password),
+    "PBKDF2",
+    false,
+    ["deriveBits"]
+  );
+
+  const derived = await crypto.subtle.deriveBits({
+    name: "PBKDF2",
+    salt,
+    iterations: 120000,
+    hash: "SHA-256"
+  }, key, 256);
+
+  return "pbkdf2$120000$" +
+    b64url(salt) + "$" +
+    b64url(new Uint8Array(derived));
+}
+
+async function checkPassword(password, stored) {
+  try {
+    const parts = stored.split("$");
+
+    if (parts.length !== 4 || parts[0] !== "pbkdf2") return false;
+
+    const iterations = Number(parts[1]);
+
+    if (!Number.isInteger(iterations) ||
+        iterations < 100000 ||
+        iterations > 500000) return false;
+
+    const salt = unb64url(parts[2]);
+    const expected = unb64url(parts[3]);
+
+    const key = await crypto.subtle.importKey(
+      "raw",
+      new TextEncoder().encode(password),
+      "PBKDF2",
+      false,
+      ["deriveBits"]
+    );
+
+    const actual = new Uint8Array(
+      await crypto.subtle.deriveBits({
+        name: "PBKDF2",
+        salt,
+        iterations,
+        hash: "SHA-256"
+      }, key, 256)
+    );
+
+    if (actual.length !== expected.length) return false;
+
+    let diff = 0;
+    for (let i = 0; i < actual.length; i++) {
+      diff |= actual[i] ^ expected[i];
+    }
+
+    return diff === 0;
+  } catch {
+    return false;
+  }
+}
+
+async function adminAuth(request, env) {
+  const token = bearer(request);
+  if (!token) return false;
+
+  // Eski API anahtarı geriye dönük uyumluluk için korunur.
+  if (env.ADMIN_API_KEY && equalText(token, env.ADMIN_API_KEY)) {
+    return true;
+  }
+
+  const payload = await verifyToken(token, env);
+  return payload?.role === "admin";
+}
+
+async function memberAuth(request, env) {
+  const token = bearer(request);
+  if (!token) return null;
+
+  const payload = await verifyToken(token, env);
+
+  if (!payload ||
+      payload.role !== "member" ||
+      !payload.member_id ||
+      !payload.device_id) return null;
+
+  const tokenHash = await sha256(token);
+
+  const row = await env.DB.prepare(`
+    SELECT
+      d.id AS device_row_id,
+      d.status AS device_status,
+      m.id AS member_id,
+      m.member_code,
+      m.display_name,
+      m.status AS member_status,
+      m.expires_at,
+      m.max_devices
+    FROM devices d
+    JOIN members m ON m.id = d.member_id
+    WHERE d.member_id = ?
+      AND d.device_id = ?
+      AND d.token_hash = ?
+  `).bind(
+    payload.member_id,
+    payload.device_id,
+    tokenHash
+  ).first();
+
+  if (!row ||
+      row.device_status !== "active" ||
+      row.member_status !== "active") return null;
+
+  if (row.expires_at &&
+      new Date(row.expires_at).getTime() <= Date.now()) return null;
+
+  await env.DB.prepare(`
+    UPDATE devices SET last_seen = CURRENT_TIMESTAMP
+    WHERE id = ?
+  `).bind(row.device_row_id).run();
+
+  return row;
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const method = request.method;
+
+    if (method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: cors
+      });
+    }
+
+      // =================================
+      // PUBLIC ISAFLIX M3U PLAYLIST
+      // =================================
+      if (method === "GET" && path === "/playlist.m3u") {
+        const source = "https://raw.githubusercontent.com/thechampisher/content-data/main/catalog/content.json";
+        const response = await fetch(source, {
+          headers: { "Accept": "application/json" }
+        });
+
+        if (!response.ok) {
+          return new Response("Katalog alınamadı: " + response.status, {
+            status: 502,
+            headers: { ...cors, "Content-Type": "text/plain; charset=utf-8" }
+          });
+        }
+
+        const data = await response.json();
+        const lines = ["#EXTM3U"];
+
+        function addItem(item, category, fallbackName) {
+          if (!item || typeof item !== "object") return;
+
+          const stream = String(
+            item.stream_url || item.direct_url || item.video_url || ""
+          ).trim();
+
+          if (!/^https?:\/\//i.test(stream)) return;
+          if (!/\.(m3u8|mp4|mkv|mpd|ts|aac|mp3)(?:$|[?#])/i.test(stream)) return;
+
+          const name = String(
+            item.name || item.title || fallbackName || "İçerik"
+          ).replace(/[\r\n"]/g, " ").trim();
+
+          const group = String(
+            item.category_name || item.group_title || category || "ISAFLIX"
+          ).replace(/[\r\n"]/g, " ").trim();
+
+          const logo = String(item.poster_url || "").replace(/[\r\n"]/g, "");
+          lines.push(
+            `#EXTINF:-1 tvg-logo="${logo}" group-title="${group}",${name}`,
+            stream
+          );
+        }
+
+        for (const movie of (Array.isArray(data.movies) ? data.movies : [])) {
+          addItem(movie, movie.category_name, "Film");
+        }
+
+        for (const series of (Array.isArray(data.series) ? data.series : [])) {
+          const episodes = Array.isArray(series.episodes) ? series.episodes : [];
+          for (const episode of episodes) {
+            addItem(
+              episode,
+              series.category_name || series.group_title,
+              series.name
+            );
+          }
+        }
+
+        return new Response(lines.join("\n") + "\n", {
+          headers: {
+            ...cors,
+            "Content-Type": "audio/x-mpegurl; charset=utf-8",
+            "Content-Disposition": 'inline; filename="isaflix.m3u"',
+            "Cache-Control": "public, max-age=120"
+          }
+        });
+      }
+
+
+    // SOURCE LIBRARY CATALOG CONNECTION TEST
+    if (method === "GET" && path === "/catalog-test") {
+      try {
+        const response = await fetch(
+          "https://api.github.com/repos/thechampisher/source-library/contents/catalog",
+          {
+            headers: {
+              "Accept": "application/vnd.github+json",
+              "User-Agent": "ISAFLIX-Worker"
+            }
+          }
+        );
+
+        if (!response.ok) {
+          return json({
+            ok: false,
+            source: "source-library",
+            status: response.status
+          }, 502);
+        }
+
+        const files = await response.json();
+
+        return json({
+          ok: true,
+          source: "thechampisher/source-library",
+          directory: "catalog",
+          count: Array.isArray(files) ? files.length : 0,
+          files: Array.isArray(files)
+            ? files.map(file => ({
+                name: file.name,
+                path: file.path,
+                type: file.type,
+                download_url: file.download_url
+              }))
+            : []
+        });
+      } catch (error) {
+        return json({
+          ok: false,
+          error: String(error)
+        }, 502);
+      }
+    }
+
+    if (method === "GET" && path === "/health") {
+  
+    try {
+
+        await env.DB.prepare("SELECT 1").first();
+
+        return json({
+          ok: true,
+          service: "ISA ADMIN API",
+          database: "connected",
+          version: "3"
+        });
+      } catch {
+        return json({
+          ok: false,
+          database: "error"
+        }, 503);
+      }
+    }
+
+    try {
+
+      // =================================
+      // ADMIN LOGIN
+      // =================================
+
+      if (method === "POST" && path === "/auth/admin/login") {
+        const body = await readJson(request);
+        const password = body?.password;
+
+        if (typeof password !== "string" ||
+            password.length < 12 ||
+            password.length > 256) {
+          return json({
+            ok: false,
+            error: "Invalid credentials"
+          }, 401);
+        }
+
+        if (!env.ADMIN_LOGIN_PASSWORD ||
+            !equalText(password, env.ADMIN_LOGIN_PASSWORD)) {
+          return json({
+            ok: false,
+            error: "Invalid credentials"
+          }, 401);
+        }
+
+        const now = Math.floor(Date.now() / 1000);
+
+        const token = await createToken({
+          role: "admin",
+          iat: now,
+          exp: now + 3600
+        }, env);
+
+        return json({
+          ok: true,
+          token,
+          token_type: "Bearer",
+          expires_in: 3600
+        });
+      }
+
+      // =================================
+      // MEMBER LOGIN
+      // =================================
+
+      if (method === "POST" && path === "/auth/member/login") {
+        const body = await readJson(request);
+
+        const memberCode = String(body?.member_code || "")
+          .trim().toUpperCase();
+
+        const password = body?.password;
+        const deviceId = String(body?.device_id || "").trim();
+        const deviceName = String(body?.device_name || "Android").trim();
+
+        if (!memberCode ||
+            typeof password !== "string" ||
+            password.length > 128 ||
+            deviceId.length < 16 ||
+            deviceId.length > 128) {
+          return json({
+            ok: false,
+            error: "Invalid login data"
+          }, 400);
+        }
+
+        const member = await env.DB.prepare(`
+          SELECT *
+          FROM members
+          WHERE member_code = ?
+          LIMIT 1
+        `).bind(memberCode).first();
+
+        if (!member ||
+            member.status !== "active" ||
+            !member.password_hash) {
+          return json({
+            ok: false,
+            error: "Invalid credentials"
+          }, 401);
+        }
+
+        if (member.expires_at &&
+            new Date(member.expires_at).getTime() <= Date.now()) {
+          return json({
+            ok: false,
+            error: "Membership expired"
+          }, 403);
+        }
+
+        const passwordOK = await checkPassword(
+          password,
+          member.password_hash
+        );
+
+        if (!passwordOK) {
+          return json({
+            ok: false,
+            error: "Invalid credentials"
+          }, 401);
+        }
+
+        const existingDevice = await env.DB.prepare(`
+          SELECT id, status
+          FROM devices
+          WHERE member_id = ? AND device_id = ?
+        `).bind(member.id, deviceId).first();
+
+        if (existingDevice?.status === "blocked") {
+          return json({
+            ok: false,
+            error: "Device blocked"
+          }, 403);
+        }
+
+        const count = await env.DB.prepare(`
+          SELECT COUNT(*) AS total
+          FROM devices
+          WHERE member_id = ? AND status = 'active'
+        `).bind(member.id).first();
+
+        if (!existingDevice &&
+            Number(count?.total || 0) >= member.max_devices) {
+          return json({
+            ok: false,
+            error: "Device limit reached",
+            max_devices: member.max_devices
+          }, 403);
+        }
+
+        const now = Math.floor(Date.now() / 1000);
+
+        const token = await createToken({
+          role: "member",
+          member_id: member.id,
+          device_id: deviceId,
+          iat: now,
+          exp: now + 43200
+        }, env);
+
+        const tokenHash = await sha256(token);
+
+        await env.DB.prepare(`
+          INSERT INTO devices
+            (id, member_id, device_id, device_name,
+             token_hash, status, last_seen)
+          VALUES (?, ?, ?, ?, ?, 'active', CURRENT_TIMESTAMP)
+          ON CONFLICT(member_id, device_id)
+          DO UPDATE SET
+            device_name = excluded.device_name,
+            token_hash = excluded.token_hash,
+            last_seen = CURRENT_TIMESTAMP
+          WHERE devices.status = 'active'
+        `).bind(
+          existingDevice?.id || uuid(),
+          member.id,
+          deviceId,
+          deviceName.slice(0, 100),
+          tokenHash
+        ).run();
+
+        return json({
+          ok: true,
+          token,
+          token_type: "Bearer",
+          expires_in: 43200,
+          member: {
+            id: member.id,
+            member_code: member.member_code,
+            display_name: member.display_name,
+            max_devices: member.max_devices
+          }
+        });
+      }
+
+      // =================================
+      // ADMIN AUTH
+      // =================================
+
+      if (path.startsWith("/admin/")) {
+        if (!await adminAuth(request, env)) {
+          return json({
+            ok: false,
+            error: "Unauthorized"
+          }, 401);
+        }
+
+        // ÜYE LİSTELEME
+        if (method === "GET" && path === "/admin/members") {
+          const result = await env.DB.prepare(`
+            SELECT
+              id, member_code, display_name, status,
+              max_devices, expires_at, created_at
+            FROM members
+            ORDER BY created_at DESC
+            LIMIT 1000
+          `).all();
+
+          return json({
+            ok: true,
+            members: result.results
+          });
+        }
+
+        // ÜYE OLUŞTURMA
+        if (method === "POST" && path === "/admin/members") {
+          const body = await readJson(request);
+
+          if (!body) {
+            return json({ ok: false, error: "Invalid JSON" }, 400);
+          }
+
+          const displayName = String(body.display_name || "").trim();
+          const password = body.password;
+          const maxDevices = Number(body.max_devices ?? 1);
+
+          if (!displayName ||
+              displayName.length > 100 ||
+              typeof password !== "string" ||
+              password.length < 10 ||
+              password.length > 128) {
+            return json({
+              ok: false,
+              error: "display_name and password (10-128 chars) required"
+            }, 400);
+          }
+
+          if (!Number.isInteger(maxDevices) ||
+              maxDevices < 1 ||
+              maxDevices > 10) {
+            return json({
+              ok: false,
+              error: "max_devices must be between 1 and 10"
+            }, 400);
+          }
+
+          const id = uuid();
+          const memberCode = "ISA-" +
+            crypto.randomUUID()
+              .replaceAll("-", "")
+              .slice(0, 12)
+              .toUpperCase();
+
+          const passwordHash = await hashPassword(password);
+          const expiresAt = body.expires_at || null;
+
+          await env.DB.prepare(`
+            INSERT INTO members
+              (id, member_code, display_name, status,
+               max_devices, expires_at, password_hash)
+            VALUES (?, ?, ?, 'active', ?, ?, ?)
+          `).bind(
+            id,
+            memberCode,
+            displayName,
+            maxDevices,
+            expiresAt,
+            passwordHash
+          ).run();
+
+          return json({
+            ok: true,
+            member: {
+              id,
+              member_code: memberCode,
+              display_name: displayName,
+              status: "active",
+              max_devices: maxDevices,
+              expires_at: expiresAt
+            }
+          }, 201);
+        }
+
+        // ÜYE DURUMU
+        const memberStatus = path.match(
+          /^\/admin\/members\/([a-f0-9-]+)\/status$/i
+        );
+
+        if (method === "PATCH" && memberStatus) {
+          const body = await readJson(request);
+          const status = body?.status;
+
+          if (!["active", "inactive", "blocked"].includes(status)) {
+            return json({
+              ok: false,
+              error: "Invalid status"
+            }, 400);
+          }
+
+          const result = await env.DB.prepare(`
+            UPDATE members SET status = ?
+            WHERE id = ?
+          `).bind(status, memberStatus[1]).run();
+
+          if (!result.meta.changes) {
+            return json({
+              ok: false,
+              error: "Member not found"
+            }, 404);
+          }
+
+          return json({
+            ok: true,
+            member_id: memberStatus[1],
+            status
+          });
+        }
+
+        // CİHAZ LİSTELEME
+        if (method === "GET" && path === "/admin/devices") {
+          const result = await env.DB.prepare(`
+            SELECT
+              d.id, d.member_id, d.device_id, d.device_name,
+              d.status, d.paired_at, d.last_seen,
+              m.member_code, m.display_name
+            FROM devices d
+            LEFT JOIN members m ON m.id = d.member_id
+            ORDER BY d.paired_at DESC
+            LIMIT 1000
+          `).all();
+
+          return json({
+            ok: true,
+            devices: result.results
+          });
+        }
+
+        // CİHAZ KİLİTLEME / AÇMA
+        const deviceAction = path.match(
+          /^\/admin\/devices\/([a-f0-9-]+)\/(lock|unlock)$/i
+        );
+
+        if (method === "POST" && deviceAction) {
+          const deviceId = deviceAction[1];
+          const status = deviceAction[2] === "lock"
+            ? "blocked"
+            : "active";
+
+          const result = await env.DB.prepare(`
+            UPDATE devices SET status = ?
+            WHERE id = ?
+          `).bind(status, deviceId).run();
+
+          if (!result.meta.changes) {
+            return json({
+              ok: false,
+              error: "Device not found"
+            }, 404);
+          }
+
+          if (status === "blocked") {
+            await env.DB.prepare(`
+              UPDATE devices SET token_hash = NULL
+              WHERE id = ?
+            `).bind(deviceId).run();
+          }
+
+          return json({
+            ok: true,
+            device_id: deviceId,
+            status
+          });
+        }
+
+        // MESAJ GÖNDERME
+        if (method === "POST" && path === "/admin/messages") {
+          const body = await readJson(request);
+
+          if (!body) {
+            return json({ ok: false, error: "Invalid JSON" }, 400);
+          }
+
+          const title = String(body.title || "").trim();
+          const message = String(body.body || "").trim();
+          const memberId = body.member_id || null;
+
+          if (!title || title.length > 150 ||
+              !message || message.length > 5000) {
+            return json({
+              ok: false,
+              error: "Title/body missing or too long"
+            }, 400);
+          }
+
+          if (memberId) {
+            const member = await env.DB.prepare(
+              "SELECT id FROM members WHERE id = ?"
+            ).bind(memberId).first();
+
+            if (!member) {
+              return json({
+                ok: false,
+                error: "Member not found"
+              }, 404);
+            }
+          }
+
+          const id = uuid();
+          const expiresAt = new Date(
+            Date.now() + 24 * 60 * 60 * 1000
+          ).toISOString();
+
+          await env.DB.prepare(`
+            INSERT INTO messages
+              (id, member_id, title, body, expires_at)
+            VALUES (?, ?, ?, ?, ?)
+          `).bind(
+            id, memberId, title, message, expiresAt
+          ).run();
+
+          return json({
+            ok: true,
+            message_id: id,
+            target: memberId ? "member" : "all_members",
+            expires_at: expiresAt
+          }, 201);
+        }
+
+        // MESAJ LİSTELEME
+        if (method === "GET" && path === "/admin/messages") {
+          const result = await env.DB.prepare(`
+            SELECT *
+            FROM messages
+            WHERE expires_at > ?
+            ORDER BY created_at DESC
+            LIMIT 1000
+          `).bind(new Date().toISOString()).all();
+
+          return json({
+            ok: true,
+            messages: result.results
+          });
+        }
+
+        return json({
+          ok: false,
+          error: "Not found"
+        }, 404);
+      }
+
+      // =================================
+      // MEMBER AUTH
+      // =================================
+
+      if (path.startsWith("/member/")) {
+        const member = await memberAuth(request, env);
+
+        if (!member) {
+          return json({
+            ok: false,
+            error: "Unauthorized"
+          }, 401);
+        }
+
+        if (method === "GET" && path === "/member/profile") {
+          return json({
+            ok: true,
+            member: {
+              id: member.member_id,
+              member_code: member.member_code,
+              display_name: member.display_name,
+              status: member.member_status,
+              expires_at: member.expires_at,
+              max_devices: member.max_devices
+            }
+          });
+        }
+
+        if (method === "GET" && path === "/member/messages") {
+          const now = new Date().toISOString();
+
+          await env.DB.prepare(`
+            DELETE FROM messages WHERE expires_at <= ?
+          `).bind(now).run();
+
+          const result = await env.DB.prepare(`
+            SELECT id, title, body, created_at, expires_at
+            FROM messages
+            WHERE expires_at > ?
+              AND (member_id IS NULL OR member_id = ?)
+            ORDER BY created_at DESC
+            LIMIT 100
+          `).bind(now, member.member_id).all();
+
+          return json({
+            ok: true,
+            messages: result.results
+          });
+        }
+
+        return json({
+          ok: false,
+          error: "Not found"
+        }, 404);
+      }
+
+      return json({
+        ok: false,
+        error: "Not found"
+      }, 404);
+
+    } catch (error) {
+      console.error("API error:", error);
+
+      return json({
+        ok: false,
+        error: "Internal server error"
+      }, 500);
+    }
+  }
+};

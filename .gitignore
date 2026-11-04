@@ -1,0 +1,10 @@
+
+# Local secrets and generated files
+.env
+.env.*
+.dev.vars
+.wrangler/
+node_modules/
+coverage/
+.DS_Store
+*.log
