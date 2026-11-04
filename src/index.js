@@ -9,6 +9,8 @@ const PLAYBACK_SESSION_SECONDS = 12 * 60 * 60;
 const PLAYBACK_TICKET_SECONDS = PLAYBACK_SESSION_SECONDS;
 const MAX_SELECTED_MEMBERS = 250;
 const MAX_GITHUB_FILE_BYTES = 900000;
+const MAX_GITHUB_CHUNK_BYTES = 24 * 1024 * 1024;
+const MAX_GITHUB_REQUEST_BYTES = 36 * 1024 * 1024;
 
 function json(data, status = 200, headers = {}) {
   return new Response(JSON.stringify(data), {
@@ -65,8 +67,12 @@ function bearer(request) {
 async function readJson(request) {
   try {
     const length = Number(request.headers.get("Content-Length") || 0);
-    if (length > 1024 * 1024) return null;
-    return await request.json();
+    if (length > MAX_GITHUB_REQUEST_BYTES) return null;
+
+    const raw = await request.text();
+    if (encoder.encode(raw).length > MAX_GITHUB_REQUEST_BYTES) return null;
+
+    return JSON.parse(raw);
   } catch {
     return null;
   }
@@ -1403,6 +1409,63 @@ async function handleGithub(request, env, url, method) {
       });
     } catch {
       return json({ ok: false, error: "GitHub file read failed" }, 502);
+    }
+  }
+
+  if (url.pathname === "/admin/github/chunk" && method === "PUT") {
+    const body = await readJson(request);
+    if (!body) return json({ ok: false, error: "Invalid JSON" }, 400);
+
+    const repo = String(body.repo || "");
+    const path = cleanGithubPath(body.path);
+    const contentBase64 = String(body.contentBase64 || "");
+    const message = String(body.message || "Upload file part");
+
+    if (!checkGithubRepo(repo, env) ||
+        !path ||
+        !isGithubPathWritable(path) ||
+        !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(contentBase64) ||
+        Math.floor(contentBase64.length * 3 / 4) > MAX_GITHUB_CHUNK_BYTES) {
+      return json({ ok: false, error: "Invalid chunk or size" }, 400);
+    }
+
+    try {
+      const encodedPath = path.split("/").map(encodeURIComponent).join("/");
+      let sha;
+
+      try {
+        const existing = await githubRequest(
+          env,
+          `/repos/${repo}/contents/${encodedPath}`
+        );
+        sha = existing.sha;
+      } catch {
+        sha = undefined;
+      }
+
+      const payload = { message, content: contentBase64 };
+      if (sha) payload.sha = sha;
+
+      const result = await githubRequest(
+        env,
+        `/repos/${repo}/contents/${encodedPath}`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        }
+      );
+
+      await audit(env, "github_chunk_uploaded", path, { repo });
+
+      return json({
+        ok: true,
+        repository: repo,
+        path,
+        sha: result.content?.sha || null
+      });
+    } catch {
+      return json({ ok: false, error: "GitHub part upload failed" }, 502);
     }
   }
 
