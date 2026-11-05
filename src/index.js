@@ -987,6 +987,26 @@ async function handleAdmin(request, env, path, method) {
     return json({ ok: true });
   }
 
+  const messageDelete = path.match(/^\/admin\/messages\/([^/]+)\/delete$/);
+  if (method === "POST" && messageDelete) {
+    const id = messageDelete[1];
+
+    const message = await env.DB.prepare(
+      "SELECT id FROM messages WHERE id = ? LIMIT 1"
+    ).bind(id).first();
+
+    if (!message) {
+      return json({ ok: false, error: "Message not found" }, 404);
+    }
+
+    await env.DB.prepare(
+      "DELETE FROM messages WHERE id = ?"
+    ).bind(id).run();
+
+    await audit(env, "message_deleted", id);
+    return json({ ok: true, deleted: true });
+  }
+
   if (method === "GET" && path === "/admin/messages") {
     const result = await env.DB.prepare(`
       SELECT id, member_id, title, body, created_at, expires_at
@@ -1252,32 +1272,51 @@ async function handleAdmin(request, env, path, method) {
 
   if (method === "POST" && path === "/admin/broadcast/stop") {
     const body = await readJson(request);
-    const id = String(body?.broadcast_id || "");
+    const requestedId = String(body?.broadcast_id || "").trim();
 
-    if (!id) return json({ ok: false, error: "Missing broadcast ID" }, 400);
+    const active = requestedId
+      ? await env.DB.prepare(`
+          SELECT id FROM broadcasts
+          WHERE id = ? AND status = 'live'
+          LIMIT 1
+        `).bind(requestedId).first()
+      : await env.DB.prepare(`
+          SELECT id FROM broadcasts
+          WHERE status = 'live'
+          ORDER BY started_at DESC, created_at DESC
+          LIMIT 1
+        `).first();
 
-    await env.DB.prepare(`
-      UPDATE broadcasts
-      SET status = 'stopped',
-          stopped_at = CURRENT_TIMESTAMP,
-          updated_at = CURRENT_TIMESTAMP
-      WHERE id = ? AND status = 'live'
-    `).bind(id).run();
+    if (!active) {
+      return json({ ok: false, error: "Aktif yayın bulunamadı." }, 404);
+    }
 
-    await env.DB.prepare(`
-      UPDATE playback_sessions
-      SET status = 'revoked'
-      WHERE broadcast_id = ? AND status = 'active'
-    `).bind(id).run();
+    const id = active.id;
 
-    await env.DB.prepare(`
-      UPDATE broadcast_recipients
-      SET status = 'ended', ended_at = CURRENT_TIMESTAMP
-      WHERE broadcast_id = ? AND status IN ('targeted', 'authorized')
-    `).bind(id).run();
+    await env.DB.batch([
+      env.DB.prepare(`
+        UPDATE broadcasts
+        SET status = 'stopped',
+            stopped_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND status = 'live'
+      `).bind(id),
+
+      env.DB.prepare(`
+        UPDATE playback_sessions
+        SET status = 'revoked'
+        WHERE broadcast_id = ? AND status = 'active'
+      `).bind(id),
+
+      env.DB.prepare(`
+        UPDATE broadcast_recipients
+        SET status = 'ended', ended_at = CURRENT_TIMESTAMP
+        WHERE broadcast_id = ? AND status IN ('targeted', 'authorized')
+      `).bind(id)
+    ]);
 
     await audit(env, "broadcast_stopped", id);
-    return json({ ok: true });
+    return json({ ok: true, broadcast_id: id, stopped: true });
   }
 
   if (method === "GET" && path === "/admin/broadcast") {
