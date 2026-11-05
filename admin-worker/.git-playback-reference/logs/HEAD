@@ -1,0 +1,10 @@
+0000000000000000000000000000000000000000 71e670980b1ce799fee6df59ad54b7367749df82 thechampisher <githuba85@gmail.com> 1793812415 +0300	commit (initial): Initial service source
+71e670980b1ce799fee6df59ad54b7367749df82 323f04febea473c9e32ebd734bd076f35671b123 thechampisher <githuba85@gmail.com> 1793813420 +0300	commit: Add 24MB chunked GitHub uploads
+323f04febea473c9e32ebd734bd076f35671b123 2073ae5b45a8e24a1c5576cf75bd6e9f6872e86f thechampisher <githuba85@gmail.com> 1793815797 +0300	commit: Add safe member deletion endpoint
+2073ae5b45a8e24a1c5576cf75bd6e9f6872e86f 2869da7115cfff5e9a71e61fef7bd3bf28a7fd3d thechampisher <githuba85@gmail.com> 1793880190 +0300	commit: Add safe worker error diagnostics
+2869da7115cfff5e9a71e61fef7bd3bf28a7fd3d b60a4e4354d94fe255aca7c11a31dfb7d8885bf9 thechampisher <githuba85@gmail.com> 1793880678 +0300	commit: Fix password hashing for Workers PBKDF2 limit
+b60a4e4354d94fe255aca7c11a31dfb7d8885bf9 a2097611dd0ff020f8b99bf577b9e61a5057f2ff thechampisher <githuba85@gmail.com> 1793882655 +0300	commit: Add message deletion and automatic broadcast stop
+a2097611dd0ff020f8b99bf577b9e61a5057f2ff e0ac52e919690ef862577a4161381ac8b526753e thechampisher <githuba85@gmail.com> 1793883573 +0300	commit: Support HTTP and HTTPS broadcast sources
+e0ac52e919690ef862577a4161381ac8b526753e 9d65b783a1ffacc198e4aab637f81ec2edb905aa thechampisher <githuba85@gmail.com> 1793883858 +0300	commit: Allow public IPv4 broadcast sources
+9d65b783a1ffacc198e4aab637f81ec2edb905aa c7f172d67b6f70f71cbffdb6836a7f609a296d23 thechampisher <githuba85@gmail.com> 1793898192 +0300	commit: Support public stream URLs and redirects
+c7f172d67b6f70f71cbffdb6836a7f609a296d23 ceb8a84a2c4bfeebc83b71e5316da1aeb9c67d06 thechampisher <githuba85@gmail.com> 1793898270 +0300	commit: Add remote Worker deployment

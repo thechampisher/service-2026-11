@@ -1,0 +1,1 @@
+{"sql": "\nSELECT type, name, tbl_name, sql\nFROM sqlite_master\nWHERE type IN ('table','index')\nORDER BY type, name\n"}
