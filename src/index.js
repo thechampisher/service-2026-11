@@ -227,110 +227,6 @@ async function adminAuth(request, env) {
   return payload?.role === "admin" ? payload : null;
 }
 
-async function memberAuth(request, env) {
-  const token = bearer(request);
-  if (!token) return null;
-
-  const payload = await verifyJwt(token, env);
-  if (!payload || payload.role !== "member") return null;
-
-  const member = await env.DB.prepare(`
-    SELECT id, member_code, display_name, status, max_devices, expires_at
-    FROM members
-    WHERE id = ?
-    LIMIT 1
-  `).bind(payload.member_id).first();
-
-  if (!member || member.status !== "active") return null;
-
-  const expiry = normalizeExpiry(member.expires_at);
-  if (expiry && expiry <= Date.now()) return null;
-
-  const device = await env.DB.prepare(`
-    SELECT id, status, token_hash
-    FROM devices
-    WHERE member_id = ? AND device_id = ?
-    LIMIT 1
-  `).bind(member.id, payload.device_id).first();
-
-  if (!device || device.status !== "active") return null;
-
-  const tokenHash = await sha256(token);
-  if (!equalText(device.token_hash || "", tokenHash)) return null;
-
-  return {
-    member,
-    deviceId: payload.device_id,
-    deviceRecordId: device.id
-  };
-}
-
-function allowedSource(raw, env) {
-  try {
-    const url = new URL(raw);
-
-    if (!["http:", "https:"].includes(url.protocol)) return false;
-    if (url.username || url.password) return false;
-
-    const host = url.hostname.toLowerCase();
-
-    if (!host || host === "localhost" ||
-        host.endsWith(".localhost") ||
-        host.endsWith(".local") ||
-        host.endsWith(".internal")) return false;
-
-    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) {
-      const parts = host.split(".").map(Number);
-      if (parts.some(x => x < 0 || x > 255)) return false;
-
-      const [a, b, c, d] = parts;
-
-      if (
-        a === 0 || a === 10 || a === 127 ||
-        a >= 224 ||
-        (a === 100 && b >= 64 && b <= 127) ||
-        (a === 169 && b === 254) ||
-        (a === 172 && b >= 16 && b <= 31) ||
-        (a === 192 && b === 168) ||
-        (a === 192 && b === 0 && c === 0) ||
-        (a === 192 && b === 0 && c === 2) ||
-        (a === 198 && (b === 18 || b === 19)) ||
-        (a === 198 && b === 51 && c === 100) ||
-        (a === 203 && b === 0 && c === 113) ||
-        (a === 255 && b === 255 && c === 255 && d === 255)
-      ) return false;
-
-      return true;
-    }
-
-    // IPv6 adresleri şimdilik kabul edilmez.
-    if (host.includes(":")) return false;
-
-    // Özel alan adları ve yerel ağ adları kabul edilmez.
-    if (
-      host === "localhost" ||
-      host.endsWith(".localhost") ||
-      host.endsWith(".local") ||
-      host.endsWith(".internal")
-    ) return false;
-
-    // Önceden tanımlı izin listesi olmadan genel DNS alan adlarını kabul et.
-    // URL uzantısı ve query parametreleri burada filtrelenmez.
-    if (host.length > 253) return false;
-
-    const labels = host.split(".");
-    if (labels.length < 2) return false;
-
-    return labels.every(label =>
-      label.length >= 1 &&
-      label.length <= 63 &&
-      /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i.test(label)
-    );
-  } catch {
-    return false;
-  }
-}
-
 async function audit(env, action, targetId = null, details = null, actor = "admin") {
   try {
     await env.DB.prepare(`
@@ -351,554 +247,31 @@ async function audit(env, action, targetId = null, details = null, actor = "admi
   }
 }
 
-/* =========================================================
-   ENCRYPTED STATELESS MEDIA TOKENS
 
-   HLS resources are encrypted in the token itself.
-   No D1 query or write occurs for individual video segments.
-   ========================================================= */
-
-async function mediaKey(env) {
-  if (!env.TOKEN_SIGNING_SECRET || env.TOKEN_SIGNING_SECRET.length < 32) {
-    throw new Error("TOKEN_SIGNING_SECRET missing");
-  }
-
-  const raw = await crypto.subtle.digest(
-    "SHA-256",
-    encoder.encode(env.TOKEN_SIGNING_SECRET + "|media-token-v1")
-  );
-
-  return crypto.subtle.importKey(
-    "raw",
-    raw,
-    { name: "AES-GCM" },
-    false,
-    ["encrypt", "decrypt"]
-  );
-}
-
-async function createMediaToken(payload, env, lifetime) {
-  const data = encoder.encode(JSON.stringify({
-    ...payload,
-    exp: nowSeconds() + lifetime,
-    ver: 1
-  }));
-
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-
-  const encrypted = await crypto.subtle.encrypt(
-    { name: "AES-GCM", iv },
-    await mediaKey(env),
-    data
-  );
-
-  return `${b64url(iv)}.${b64url(new Uint8Array(encrypted))}`;
-}
-
-async function readMediaToken(token, env) {
-  try {
-    const parts = token.split(".");
-    if (parts.length !== 2) return null;
-
-    const decrypted = await crypto.subtle.decrypt(
-      { name: "AES-GCM", iv: unb64url(parts[0]) },
-      await mediaKey(env),
-      unb64url(parts[1])
-    );
-
-    const payload = JSON.parse(decoder.decode(decrypted));
-
-    if (payload.ver !== 1 ||
-        !payload.exp ||
-        payload.exp <= nowSeconds()) return null;
-
-    return payload;
-  } catch {
-    return null;
-  }
-}
-
-async function makeResourceUrl(sourceUrl, env, session) {
-  if (!allowedSource(sourceUrl, env)) {
-    throw new Error("Source host is not allowed");
-  }
-
-  // Playlist kaynakları oturum kontrolünden geçer.
-  // Segment ve medya kaynakları stateless kalır.
-  const kind = isManifest(sourceUrl, "")
-    ? "manifest"
-    : "resource";
-
-  const token = await createMediaToken({
-    kind,
-    url: sourceUrl,
-    sid: session.sid,
-    member_id: session.member_id,
-    device_id: session.device_id
-  }, env, PLAYBACK_TOKEN_SECONDS);
-
-  return `/p/${token}`;
-}
-
-function isManifest(url, contentType) {
-  return /\.m3u8?($|\?)/i.test(url) ||
-    /mpegurl|vnd\.apple\.mpegurl/i.test(contentType || "");
-}
-
-async function rewriteManifest(text, baseUrl, env, session) {
-  const lines = text.split(/\r?\n/);
-  const output = [];
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-
-    if (!trimmed) {
-      output.push(line);
-      continue;
-    }
-
-    if (trimmed.startsWith("#")) {
-      const rewritten = await rewriteUriAttributes(
-        line, baseUrl, env, session
-      );
-      output.push(rewritten);
-      continue;
-    }
-
-    const absolute = new URL(trimmed, baseUrl).toString();
-    output.push(await makeResourceUrl(absolute, env, session));
-  }
-
-  return output.join("\n");
-}
-
-async function rewriteUriAttributes(line, baseUrl, env, session) {
-  const regex = /URI="([^"]+)"/g;
-  let result = line;
-  const matches = [...line.matchAll(regex)];
-
-  for (const match of matches) {
-    const original = match[1];
-    const absolute = new URL(original, baseUrl).toString();
-    const replacement = await makeResourceUrl(absolute, env, session);
-    result = result.replace(
-      `URI="${original}"`,
-      `URI="${replacement}"`
-    );
-  }
-
-  return result;
-}
-
-function mediaResponseHeaders(upstream, manifest = false, cors = {}) {
-  const headers = new Headers(cors);
-
-  const type = upstream.headers.get("Content-Type");
-  if (type) headers.set("Content-Type", type);
-
-  for (const name of [
-    "Content-Range",
-    "Accept-Ranges",
-    "Content-Length"
-  ]) {
-    const value = upstream.headers.get(name);
-    if (value && !manifest) headers.set(name, value);
-  }
-
-  headers.set("Cache-Control", "private, no-store");
-  headers.set("X-Content-Type-Options", "nosniff");
-
-  return headers;
-}
-
-async function activePlaybackSession(env, payload) {
-  if (!payload?.sid || !payload?.member_id || !payload?.device_id) {
-    return false;
-  }
-
-  // Bu sorgu yalnızca ana/alt oynatma listelerinde çalışır.
-  // Video segmentleri bu fonksiyona uğramaz.
-  const session = await env.DB.prepare(`
-    SELECT ps.id
-    FROM playback_sessions ps
-    JOIN members m
-      ON m.id = ps.member_id
-    JOIN devices d
-      ON d.member_id = ps.member_id
-     AND d.device_id = ps.device_id
-    LEFT JOIN broadcasts b
-      ON b.id = ps.broadcast_id
-    WHERE ps.id = ?
-      AND ps.member_id = ?
-      AND ps.device_id = ?
-      AND ps.status = 'active'
-      AND ps.expires_at > ?
-      AND m.status = 'active'
-      AND d.status = 'active'
-      AND (
-        m.expires_at IS NULL
-        OR m.expires_at = ''
-        OR julianday(m.expires_at) > julianday('now')
-      )
-      AND (
-        ps.broadcast_id IS NULL
-        OR b.status = 'live'
-      )
-    LIMIT 1
-  `).bind(
-    payload.sid,
-    payload.member_id,
-    payload.device_id,
-    nowSeconds()
-  ).first();
-
-  return Boolean(session);
-}
-
-async function proxyMedia(request, env, token, cors = {}) {
-  const respondJson = (data, status) => json(data, status, cors);
-  const payload = await readMediaToken(token, env);
-
-  if (!payload ||
-      !["play", "manifest", "resource"].includes(payload.kind) ||
-      !payload.url ||
-      !payload.sid ||
-      !allowedSource(payload.url, env)) {
-    return respondJson({ ok: false, error: "Invalid or expired playback token" }, 403);
-  }
-
-  // Ana ve alt oynatma listelerinde iptal kontrolü.
-  // Segment tokenlarında D1 sorgusu kesinlikle yapılmaz.
-  if (payload.kind === "play" || payload.kind === "manifest") {
-    let active = false;
-
-    try {
-      active = await activePlaybackSession(env, payload);
-    } catch {
-      return respondJson({ ok: false, error: "Playback authorization unavailable" }, 503);
-    }
-
-    if (!active) {
-      return respondJson({ ok: false, error: "Playback session revoked or expired" }, 403);
-    }
-  }
-
-  const headers = new Headers({
-    "Accept": request.headers.get("Accept") || "*/*",
-    "User-Agent": "MediaProxy/2.0"
-  });
-
-  try {
-    const sourceHost = new URL(payload.url).hostname.toLowerCase();
-    if (sourceHost === "andro.evrenesoglu101.click") {
-      headers.set("Referer", "https://taraftarium24.xyz/");
-      headers.set("Origin", "https://taraftarium24.xyz");
-    }
-  } catch (_) {}
-
-
-  const range = request.headers.get("Range");
-  if (range) headers.set("Range", range);
-
-  let upstream;
-  let currentUrl = payload.url;
-
-  // Yönlendirmeleri kontrollü takip et.
-  // Her yeni adres yeniden doğrulanır.
-  for (let redirectCount = 0; redirectCount <= 5; redirectCount++) {
-    if (!allowedSource(currentUrl, env)) {
-      return respondJson({
-        ok: false,
-        error: "Redirect source is not permitted"
-      }, 502);
-    }
-
-    try {
-      upstream = await fetch(currentUrl, {
-        method: "GET",
-        headers,
-        redirect: "manual"
-      });
-    } catch {
-      return respondJson({
-        ok: false,
-        error: "Upstream unavailable"
-      }, 502);
-    }
-
-    if (upstream.status < 300 || upstream.status >= 400) {
-      break;
-    }
-
-    const location = upstream.headers.get("Location");
-
-    if (!location || redirectCount === 5) {
-      return respondJson({
-        ok: false,
-        error: "Redirect limit exceeded"
-      }, 502);
-    }
-
-    try {
-      currentUrl = new URL(location, currentUrl).toString();
-    } catch {
-      return respondJson({
-        ok: false,
-        error: "Invalid redirect address"
-      }, 502);
-    }
-  }
-
-  if (!upstream || (upstream.status >= 300 && upstream.status < 400)) {
-    return respondJson({
-      ok: false,
-      error: "Upstream redirect failed"
-    }, 502);
-  }
-
-  if (!upstream.ok && upstream.status !== 206) {
-    return respondJson({ ok: false, error: "Upstream request failed" }, 502);
-  }
-
-  const contentType = upstream.headers.get("Content-Type") || "";
-  const manifest = isManifest(currentUrl, contentType);
-
-  if (manifest) {
-    // Uzantısı tanınmayan alt oynatma listeleri ancak upstream
-    // Content-Type yanıtından sonra anlaşılabilir.
-    // Bu kontrol manifest başına yapılır; segmentlere uygulanmaz.
-    if (payload.kind === "resource") {
-      let active = false;
-
-      try {
-        active = await activePlaybackSession(env, payload);
-      } catch {
-        return respondJson({
-          ok: false,
-          error: "Playback authorization unavailable"
-        }, 503);
-      }
-
-      if (!active) {
-        return respondJson({
-          ok: false,
-          error: "Playback session revoked or expired"
-        }, 403);
-      }
-    }
-
-    const sourceText = await upstream.text();
-
-    if (sourceText.length > 2 * 1024 * 1024) {
-      return respondJson({ ok: false, error: "Manifest too large" }, 502);
-    }
-
-    let rewritten;
-
-    try {
-      rewritten = await rewriteManifest(
-        sourceText,
-        currentUrl,
-        env,
-        {
-          sid: payload.sid,
-          member_id: payload.member_id,
-          device_id: payload.device_id
-        }
-      );
-    } catch {
-      return respondJson({ ok: false, error: "Manifest rewrite failed" }, 502);
-    }
-
-    return new Response(rewritten, {
-      status: 200,
-      headers: mediaResponseHeaders(upstream, true, cors)
-    });
-  }
-
-  return new Response(upstream.body, {
-    status: upstream.status,
-    headers: mediaResponseHeaders(upstream, false, cors)
-  });
-}
-
-async function issuePlayback(env, member, deviceId, source, broadcastId = null) {
-  if (!source || source.status !== "active") {
-    return { error: "Stream unavailable" };
-  }
-
-  if (!allowedSource(source.source_url, env)) {
-    return { error: "Stream source is not permitted" };
-  }
-
-  const sid = uuid();
-  const ticket = await createMediaToken({
-    kind: "play",
-    url: source.source_url,
-    sid,
-    member_id: member.id,
-    device_id: deviceId,
-    broadcast_id: broadcastId
-  }, env, PLAYBACK_TICKET_SECONDS);
-
-  const ticketHash = await sha256(ticket);
-
-  // Oynatma bileti ve oturum aynı 12 saatlik süreyi kullanır.
-  const expiry = nowSeconds() + PLAYBACK_SESSION_SECONDS;
-
-  await env.DB.prepare(`
-    INSERT INTO playback_sessions
-      (id, member_id, device_id, stream_source_id, broadcast_id,
-       ticket_hash, status, expires_at)
-    VALUES (?, ?, ?, ?, ?, ?, 'active', ?)
-  `).bind(
-    sid,
-    member.id,
-    deviceId,
-    source.id,
-    broadcastId,
-    ticketHash,
-    expiry
-  ).run();
-
-  return {
-    playback_url: `/play/${ticket}`,
-    expires_in: PLAYBACK_TICKET_SECONDS
-  };
-}
-
-/* =========================================================
-   LOGIN
-   ========================================================= */
-
-async function handleLogin(request, env, path) {
+async function handleAdminLogin(request, env) {
   const body = await readJson(request);
   if (!body) return json({ ok: false, error: "Invalid JSON" }, 400);
 
-  if (path === "/auth/admin/login") {
-    const password = String(body.password || "");
+  const password = String(body.password || "");
 
-    if (!env.ADMIN_LOGIN_PASSWORD ||
-        !equalText(password, env.ADMIN_LOGIN_PASSWORD)) {
-      return json({ ok: false, error: "Invalid credentials" }, 401);
-    }
-
-    const token = await createJwt({
-      role: "admin",
-      id: "admin"
-    }, env, ADMIN_TOKEN_SECONDS);
-
-    return json({
-      ok: true,
-      token,
-      expires_in: ADMIN_TOKEN_SECONDS
-    });
+  if (!env.ADMIN_LOGIN_PASSWORD ||
+      !equalText(password, env.ADMIN_LOGIN_PASSWORD)) {
+    return json({ ok: false, error: "Invalid credentials" }, 401);
   }
 
-  if (path === "/auth/member/login") {
-    const code = String(body.member_code || "").trim();
-    const password = String(body.password || "");
-    const deviceId = String(body.device_id || "").trim();
-    const deviceName = String(body.device_name || "Android").slice(0, 120);
+  const token = await createJwt(
+    { role: "admin", id: "admin" },
+    env,
+    ADMIN_TOKEN_SECONDS
+  );
 
-    if (!code || !password || !deviceId || deviceId.length > 180) {
-      return json({ ok: false, error: "Missing login fields" }, 400);
-    }
-
-    const member = await env.DB.prepare(`
-      SELECT *
-      FROM members
-      WHERE member_code = ?
-      LIMIT 1
-    `).bind(code).first();
-
-    if (!member ||
-        member.status !== "active" ||
-        !member.password_hash) {
-      return json({ ok: false, error: "Invalid credentials" }, 401);
-    }
-
-    const expiry = normalizeExpiry(member.expires_at);
-    if (expiry && expiry <= Date.now()) {
-      return json({ ok: false, error: "Membership expired" }, 403);
-    }
-
-    if (!await checkPassword(password, member.password_hash)) {
-      return json({ ok: false, error: "Invalid credentials" }, 401);
-    }
-
-    const existing = await env.DB.prepare(`
-      SELECT id, status
-      FROM devices
-      WHERE member_id = ? AND device_id = ?
-      LIMIT 1
-    `).bind(member.id, deviceId).first();
-
-    if (existing?.status === "blocked") {
-      return json({ ok: false, error: "Device blocked" }, 403);
-    }
-
-    const count = await env.DB.prepare(`
-      SELECT COUNT(*) AS total
-      FROM devices
-      WHERE member_id = ? AND status = 'active'
-    `).bind(member.id).first();
-
-    if (!existing && Number(count?.total || 0) >= Number(member.max_devices || 1)) {
-      return json({ ok: false, error: "Device limit reached" }, 403);
-    }
-
-    const token = await createJwt({
-      role: "member",
-      member_id: member.id,
-      device_id: deviceId
-    }, env, MEMBER_TOKEN_SECONDS);
-
-    const tokenHash = await sha256(token);
-    const deviceRecordId = existing?.id || uuid();
-
-    if (existing) {
-      await env.DB.prepare(`
-        UPDATE devices
-        SET device_name = ?, token_hash = ?, status = 'active',
-            last_seen = CURRENT_TIMESTAMP
-        WHERE id = ?
-      `).bind(deviceName, tokenHash, deviceRecordId).run();
-    } else {
-      await env.DB.prepare(`
-        INSERT INTO devices
-          (id, member_id, device_id, device_name, token_hash,
-           status, paired_at, last_seen)
-        VALUES (?, ?, ?, ?, ?, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-      `).bind(
-        deviceRecordId,
-        member.id,
-        deviceId,
-        deviceName,
-        tokenHash
-      ).run();
-    }
-
-    return json({
-      ok: true,
-      token,
-      expires_in: MEMBER_TOKEN_SECONDS,
-      member: {
-        id: member.id,
-        member_code: member.member_code,
-        display_name: member.display_name,
-        expires_at: member.expires_at,
-        max_devices: member.max_devices
-      }
-    });
-  }
-
-  return json({ ok: false, error: "Not found" }, 404);
+  return json({
+    ok: true,
+    token,
+    expires_in: ADMIN_TOKEN_SECONDS
+  });
 }
 
-/* =========================================================
-   ADMIN API
-   ========================================================= */
 
 async function handleAdmin(request, env, path, method) {
   if (method === "GET" && path === "/admin/members") {
@@ -1169,253 +542,6 @@ async function handleAdmin(request, env, path, method) {
     }, 201);
   }
 
-  if (method === "POST" && path === "/admin/streams") {
-    const body = await readJson(request);
-    if (!body) return json({ ok: false, error: "Invalid JSON" }, 400);
-
-    const name = String(body.name || "").trim();
-    const sourceUrl = String(body.source_url || "").trim();
-    const sourceType = String(body.source_type || "hls");
-
-    if (!name || name.length > 180 ||
-        !allowedSource(sourceUrl, env) ||
-        !["hls"].includes(sourceType)) {
-      return json({ ok: false, error: "Invalid stream source or host" }, 400);
-    }
-
-    const id = uuid();
-
-    await env.DB.prepare(`
-      INSERT INTO stream_sources
-        (id, name, source_url, source_type, status)
-      VALUES (?, ?, ?, ?, 'active')
-    `).bind(id, name, sourceUrl, sourceType).run();
-
-    await audit(env, "stream_created", id);
-
-    return json({
-      ok: true,
-      stream: { id, name, source_type: sourceType, status: "active" }
-    }, 201);
-  }
-
-  if (method === "GET" && path === "/admin/streams") {
-    const result = await env.DB.prepare(`
-      SELECT id, name, source_type, status, created_at, updated_at
-      FROM stream_sources
-      ORDER BY created_at DESC
-      LIMIT 500
-    `).all();
-
-    return json({ ok: true, streams: result.results || [] });
-  }
-
-  const streamRoute = path.match(/^\/admin\/streams\/([^/]+)$/);
-
-  if (method === "PATCH" && streamRoute) {
-    const body = await readJson(request);
-    const id = streamRoute[1];
-
-    if (body?.status && ["active", "inactive", "blocked"].includes(body.status)) {
-      await env.DB.prepare(`
-        UPDATE stream_sources SET status = ?, updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-      `).bind(body.status, id).run();
-
-      await audit(env, "stream_status_changed", id, {
-        status: body.status
-      });
-
-      return json({ ok: true });
-    }
-
-    if (body?.source_url) {
-      const sourceUrl = String(body.source_url);
-      if (!allowedSource(sourceUrl, env)) {
-        return json({ ok: false, error: "Source host not allowed" }, 400);
-      }
-
-      await env.DB.prepare(`
-        UPDATE stream_sources
-        SET source_url = ?, updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-      `).bind(sourceUrl, id).run();
-
-      await audit(env, "stream_source_updated", id);
-      return json({ ok: true });
-    }
-
-    return json({ ok: false, error: "No valid update" }, 400);
-  }
-
-  if (method === "POST" && path === "/admin/broadcast/start") {
-    const body = await readJson(request);
-    if (!body) return json({ ok: false, error: "Invalid JSON" }, 400);
-
-    const title = String(body.title || "").trim();
-    const message = String(body.message || "");
-    const streamId = String(body.stream_id || "");
-    const audience = body.audience || "all";
-
-    if (!title || title.length > 180 ||
-        message.length > 5000 ||
-        !streamId ||
-        !["all", "selected"].includes(audience)) {
-      return json({ ok: false, error: "Invalid broadcast" }, 400);
-    }
-
-    const source = await env.DB.prepare(`
-      SELECT id, status FROM stream_sources WHERE id = ? LIMIT 1
-    `).bind(streamId).first();
-
-    if (!source || source.status !== "active") {
-      return json({ ok: false, error: "Stream unavailable" }, 400);
-    }
-
-    const broadcastId = uuid();
-
-    const statements = [
-      env.DB.prepare(`
-        INSERT INTO broadcasts
-          (id, title, message, stream_source_id, audience,
-           status, created_by, started_at)
-        VALUES (?, ?, ?, ?, ?, 'live', 'admin', CURRENT_TIMESTAMP)
-      `).bind(broadcastId, title, message, streamId, audience)
-    ];
-
-    let recipientCount = 0;
-
-    if (audience === "all") {
-      // Yayın başladığı andaki aktif üyeleri sabitle.
-      // Sonradan eklenen üyeler bu yayına otomatik katılamaz.
-      statements.push(env.DB.prepare(`
-        INSERT INTO broadcast_recipients
-          (id, broadcast_id, member_id, status)
-        SELECT lower(hex(randomblob(16))), ?, id, 'targeted'
-        FROM members
-        WHERE status = 'active'
-      `).bind(broadcastId));
-
-      const count = await env.DB.prepare(`
-        SELECT COUNT(*) AS total
-        FROM members
-        WHERE status = 'active'
-      `).first();
-
-      recipientCount = Number(count?.total || 0);
-
-      if (!recipientCount) {
-        return json({ ok: false, error: "No active recipients" }, 400);
-      }
-    } else {
-      const ids = Array.isArray(body.member_ids)
-        ? [...new Set(body.member_ids.map(String))]
-        : [];
-
-      if (!ids.length || ids.length > MAX_SELECTED_MEMBERS) {
-        return json({ ok: false, error: "Invalid recipient selection" }, 400);
-      }
-
-      const placeholders = ids.map(() => "?").join(",");
-      const members = await env.DB.prepare(`
-        SELECT id FROM members
-        WHERE status = 'active' AND id IN (${placeholders})
-      `).bind(...ids).all();
-
-      const validIds = (members.results || []).map(x => x.id);
-
-      if (!validIds.length) {
-        return json({ ok: false, error: "No active recipients" }, 400);
-      }
-
-      recipientCount = validIds.length;
-
-      for (const memberId of validIds) {
-        statements.push(env.DB.prepare(`
-          INSERT INTO broadcast_recipients
-            (id, broadcast_id, member_id, status)
-          VALUES (?, ?, ?, 'targeted')
-        `).bind(uuid(), broadcastId, memberId));
-      }
-    }
-
-    await env.DB.batch(statements);
-    await audit(env, "broadcast_started", broadcastId, {
-      audience,
-      recipient_count: recipientCount
-    });
-
-    return json({
-      ok: true,
-      broadcast_id: broadcastId,
-      audience,
-      recipient_count: audience === "all" ? "all-active-members" : recipientCount
-    }, 201);
-  }
-
-  if (method === "POST" && path === "/admin/broadcast/stop") {
-    const body = await readJson(request);
-    const requestedId = String(body?.broadcast_id || "").trim();
-
-    const active = requestedId
-      ? await env.DB.prepare(`
-          SELECT id FROM broadcasts
-          WHERE id = ? AND status = 'live'
-          LIMIT 1
-        `).bind(requestedId).first()
-      : await env.DB.prepare(`
-          SELECT id FROM broadcasts
-          WHERE status = 'live'
-          ORDER BY started_at DESC, created_at DESC
-          LIMIT 1
-        `).first();
-
-    if (!active) {
-      return json({ ok: false, error: "Aktif yayın bulunamadı." }, 404);
-    }
-
-    const id = active.id;
-
-    await env.DB.batch([
-      env.DB.prepare(`
-        UPDATE broadcasts
-        SET status = 'stopped',
-            stopped_at = CURRENT_TIMESTAMP,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE id = ? AND status = 'live'
-      `).bind(id),
-
-      env.DB.prepare(`
-        UPDATE playback_sessions
-        SET status = 'revoked'
-        WHERE broadcast_id = ? AND status = 'active'
-      `).bind(id),
-
-      env.DB.prepare(`
-        UPDATE broadcast_recipients
-        SET status = 'ended', ended_at = CURRENT_TIMESTAMP
-        WHERE broadcast_id = ? AND status IN ('targeted', 'authorized')
-      `).bind(id)
-    ]);
-
-    await audit(env, "broadcast_stopped", id);
-    return json({ ok: true, broadcast_id: id, stopped: true });
-  }
-
-  if (method === "GET" && path === "/admin/broadcast") {
-    const result = await env.DB.prepare(`
-      SELECT b.id, b.title, b.message, b.audience, b.status,
-             b.started_at, b.stopped_at, b.created_at,
-             s.name AS stream_name
-      FROM broadcasts b
-      LEFT JOIN stream_sources s ON s.id = b.stream_source_id
-      ORDER BY b.created_at DESC
-      LIMIT 100
-    `).all();
-
-    return json({ ok: true, broadcasts: result.results || [] });
-  }
-
   if (method === "GET" && path === "/admin/audit") {
     const result = await env.DB.prepare(`
       SELECT id, actor_type, actor_id, action,
@@ -1430,12 +556,6 @@ async function handleAdmin(request, env, path, method) {
 
   return json({ ok: false, error: "Admin endpoint not found" }, 404);
 }
-
-/* =========================================================
-   PRIVATE GITHUB API
-   Token is read only from Worker environment secrets.
-   APK and member responses never receive the token.
-   ========================================================= */
 
 function allowedGithubRepos(env) {
   return (env.GITHUB_ALLOWED_REPOS || "")
@@ -1514,6 +634,696 @@ async function githubRequest(env, path, options = {}) {
 
   return data;
 }
+
+
+const SOURCE_REPO = "thechampisher/content-data";
+const SOURCE_ROOT = "sources";
+const SOURCE_PART_LIMIT = 700000;
+
+async function sourceRead(env, path) {
+  const file = await githubRequest(
+    env,
+    `/repos/${SOURCE_REPO}/contents/${path.split("/").map(encodeURIComponent).join("/")}`
+  );
+  if (Array.isArray(file) || file.type !== "file" || !file.content) {
+    throw new Error("Source file unavailable");
+  }
+  const bytes = Uint8Array.from(
+    atob(file.content.replace(/\n/g, "")),
+    c => c.charCodeAt(0)
+  );
+  return JSON.parse(decoder.decode(bytes));
+}
+
+async function sourceWrite(env, path, value, message) {
+  const encodedPath = path.split("/").map(encodeURIComponent).join("/");
+  let sha;
+  try {
+    const old = await githubRequest(
+      env, `/repos/${SOURCE_REPO}/contents/${encodedPath}`
+    );
+    sha = old.sha;
+  } catch {}
+
+  const bytes = encoder.encode(
+    typeof value === "string" ? value : JSON.stringify(value)
+  );
+  const content = btoa(Array.from(bytes, b => String.fromCharCode(b)).join(""));
+  const payload = { message, content };
+  if (sha) payload.sha = sha;
+
+  return githubRequest(
+    env,
+    `/repos/${SOURCE_REPO}/contents/${encodedPath}`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    }
+  );
+}
+
+async function sourceGetCurrent(env) {
+  const pointer = await sourceRead(env, `${SOURCE_ROOT}/current.json`);
+  if (!pointer.generation) throw new Error("Invalid source pointer");
+  const base = `${SOURCE_ROOT}/generations/${pointer.generation}`;
+  const manifest = await sourceRead(env, `${base}/manifest.json`);
+  if (!Array.isArray(manifest.parts)) throw new Error("Invalid source manifest");
+  return { pointer, manifest, base };
+}
+
+async function sourceReadRecords(env, current) {
+  const records = [];
+  for (const part of current.manifest.parts) {
+    const rows = await sourceRead(env, `${current.base}/${part}`);
+    if (!Array.isArray(rows)) throw new Error("Invalid source part");
+    records.push(...rows);
+  }
+  return records;
+}
+
+async function sourcePublishRecords(env, records) {
+  const generation = crypto.randomUUID().replace(/-/g, "");
+  const base = `${SOURCE_ROOT}/generations/${generation}`;
+  const parts = [];
+  let batch = [];
+
+  async function flush() {
+    if (!batch.length) return;
+    const name = `part-${String(parts.length).padStart(5, "0")}.json`;
+    await sourceWrite(env, `${base}/${name}`, batch, "Save source generation part");
+    parts.push(name);
+    batch = [];
+  }
+
+  for (const row of records) {
+    const test = [...batch, row];
+    if (encoder.encode(JSON.stringify(test)).length > SOURCE_PART_LIMIT && batch.length) {
+      await flush();
+    }
+    batch.push(row);
+    if (encoder.encode(JSON.stringify(batch)).length > SOURCE_PART_LIMIT) {
+      throw new Error("A single source record is too large");
+    }
+  }
+  await flush();
+
+  const manifest = {
+    generation,
+    parts,
+    count: records.length,
+    createdAt: new Date().toISOString()
+  };
+
+  await sourceWrite(env, `${base}/manifest.json`, manifest, "Publish source manifest");
+  await sourceWrite(
+    env,
+    `${SOURCE_ROOT}/current.json`,
+    { generation, updatedAt: new Date().toISOString() },
+    "Activate source generation"
+  );
+  return manifest;
+}
+
+
+// XTREAM_MAG_SOURCE_V1
+function validateExternalSourceHost(value) {
+  let u;
+  try { u = new URL(String(value || "").trim()); }
+  catch { throw new Error("Geçerli sunucu adresi girilmedi."); }
+
+  if (!["http:", "https:"].includes(u.protocol) ||
+      u.username || u.password || u.search || u.hash) {
+    throw new Error("Sunucu adresi geçersiz.");
+  }
+
+  const host=u.hostname.toLowerCase();
+  if (!host || host==="localhost" || host.endsWith(".localhost") ||
+      host.endsWith(".local") || host.endsWith(".internal") ||
+      host.endsWith(".test")) {
+    throw new Error("Yerel sunucu adreslerine izin verilmiyor.");
+  }
+
+  if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) {
+    const a=host.split(".").map(Number);
+    if (a.some(x=>x<0||x>255) ||
+        a[0]===10 || a[0]===127 || a[0]===0 ||
+        a[0]>=224 || (a[0]===169&&a[1]===254) ||
+        (a[0]===172&&a[1]>=16&&a[1]<=31) ||
+        (a[0]===192&&a[1]===168) ||
+        (a[0]===100&&a[1]>=64&&a[1]<=127)) {
+      throw new Error("Özel ağ adreslerine izin verilmiyor.");
+    }
+  }
+
+  u.pathname=u.pathname.replace(/\/+$/,"");
+  return u;
+}
+
+async function externalJson(url, headers={}) {
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),25000);
+  try {
+    const response=await fetch(url,{
+      method:"GET",
+      headers,
+      redirect:"error",
+      signal:controller.signal
+    });
+    if(!response.ok) throw new Error("Kaynak sunucu HTTP "+response.status);
+    const text=await response.text();
+    if(text.length>12*1024*1024) throw new Error("Kaynak yanıtı çok büyük.");
+    try { return JSON.parse(text); }
+    catch { throw new Error("Kaynak sunucu geçerli JSON döndürmedi."); }
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function sourceCredentials(body) {
+  const host=validateExternalSourceHost(body.host);
+  const user=String(body.username||"").trim();
+  const pass=String(body.password||"");
+  if(!user||!pass||user.length>256||pass.length>256)
+    throw new Error("Kullanıcı adı ve şifre gerekli.");
+  return {host,user,pass};
+}
+
+async function xtreamAction(info,action,categoryId=null,seriesId=null) {
+  const endpoint=new URL(info.host.href);
+  if(!endpoint.pathname.toLowerCase().endsWith("/player_api.php"))
+    endpoint.pathname=endpoint.pathname.replace(/\/+$/,"")+"/player_api.php";
+
+  endpoint.searchParams.set("username",info.user);
+  endpoint.searchParams.set("password",info.pass);
+  endpoint.searchParams.set("action",action);
+  if(categoryId!==null) endpoint.searchParams.set("category_id",String(categoryId));
+  if(seriesId!==null) endpoint.searchParams.set("series_id",String(seriesId));
+
+  return externalJson(endpoint.href,{
+    "Accept":"application/json",
+    "User-Agent":"Mozilla/5.0"
+  });
+}
+
+function arrayValue(value) {
+  return Array.isArray(value)?value:[];
+}
+
+function xtreamStreamRecord(info,row,type,group) {
+  const id=String(row.stream_id||row.series_id||row.id||"");
+  if(!id) return null;
+  const ext=String(row.container_extension||(
+    type==="live"?"ts":type==="movie"?"mp4":"mkv"
+  )).toLowerCase().replace(/[^a-z0-9]/g,"").slice(0,8) ||
+    (type==="live"?"ts":type==="movie"?"mp4":"mkv");
+
+  const path=type==="live"?"live":type==="movie"?"movie":"series";
+  const url=info.host.origin+info.host.pathname.replace(/\/player_api\.php$/i,"")+
+    "/"+path+"/"+encodeURIComponent(info.user)+"/"+
+    encodeURIComponent(info.pass)+"/"+encodeURIComponent(id)+"."+ext;
+
+  return {
+    id:uuid(),
+    source:"xtream",
+    type,
+    name:String(row.name||row.title||"İsimsiz"),
+    url,
+    logo:String(row.stream_icon||row.cover||row.movie_image||""),
+    group:String(group||"Diğer"),
+    tvgId:String(row.epg_channel_id||""),
+    streamId:id
+  };
+}
+
+async function handleXtreamCategories(body) {
+  const info=sourceCredentials(body);
+  const specs=[
+    ["live","get_live_categories"],
+    ["vod","get_vod_categories"],
+    ["series","get_series_categories"]
+  ];
+  const categories=[];
+  for(const [type,action] of specs) {
+    const rows=arrayValue(await xtreamAction(info,action));
+    for(const row of rows) {
+      categories.push({
+        type,
+        id:String(row.category_id||row.id||""),
+        name:String(row.category_name||row.name||"Diğer")
+      });
+    }
+  }
+  return categories;
+}
+
+async function handleXtreamImport(body) {
+  const info=sourceCredentials(body);
+  const selected=Array.isArray(body.categories)?body.categories:[];
+  if(!selected.length||selected.length>60)
+    throw new Error("En fazla 60 kategori seçilebilir.");
+
+  const records=[];
+  for(const category of selected) {
+    const type=String(category.type||"");
+    const id=String(category.id||"");
+    const name=String(category.name||"Diğer");
+    if(!["live","vod","series"].includes(type)||!id) continue;
+
+    const action=type==="live"?"get_live_streams":
+      type==="vod"?"get_vod_streams":"get_series";
+    const rows=arrayValue(await xtreamAction(info,action,id));
+
+    if(type!=="series") {
+      for(const row of rows) {
+        const record=xtreamStreamRecord(
+          info,row,type==="live"?"live":"movie",name
+        );
+        if(record) records.push(record);
+        if(records.length>=12000) break;
+      }
+    } else {
+      if(rows.length>150) throw new Error("Bir dizin kategorisinde 150'den fazla dizi var. Kategorileri bölerek aktar.");
+      for(const series of rows) {
+        const sid=String(series.series_id||series.id||"");
+        if(!sid) continue;
+        const detail=await xtreamAction(info,"get_series_info",null,sid);
+        const seasons=detail.episodes||{};
+        let found=0;
+
+        for(const seasonKey of Object.keys(seasons)) {
+          for(const ep of arrayValue(seasons[seasonKey])) {
+            const eid=String(ep.id||ep.episode_id||"");
+            if(!eid) continue;
+            const ext=String(ep.container_extension||"mkv")
+              .toLowerCase().replace(/[^a-z0-9]/g,"").slice(0,8)||"mkv";
+            const epNo=ep.episode_num||ep.episode_number||"";
+            const title=String(ep.title||ep.name||"Bölüm");
+            records.push({
+              id:uuid(),
+              source:"xtream",
+              type:"episode",
+              name:String(series.name||"Dizi")+" - S"+
+                String(seasonKey)+" E"+String(epNo)+" - "+title,
+              seriesName:String(series.name||""),
+              season:String(seasonKey),
+              episode:String(epNo),
+              url:info.host.origin+
+                info.host.pathname.replace(/\/player_api\.php$/i,"")+
+                "/series/"+encodeURIComponent(info.user)+"/"+
+                encodeURIComponent(info.pass)+"/"+
+                encodeURIComponent(eid)+"."+ext,
+              logo:String(ep.info?.movie_image||series.cover||""),
+              group:name,
+              seriesId:sid
+            });
+            found++;
+            if(records.length>=12000) break;
+          }
+          if(records.length>=12000) break;
+        }
+        if(!found) {
+          records.push({
+            id:uuid(),source:"xtream",type:"series",
+            name:String(series.name||"İsimsiz"),
+            url:"",logo:String(series.cover||""),
+            group:name,seriesId:sid
+          });
+        }
+        if(records.length>=12000) break;
+      }
+    }
+    if(records.length>=12000) break;
+  }
+  return records;
+}
+
+function magUnwrap(value) {
+  let x=value?.js??value;
+  if(typeof x==="string") {
+    try { x=JSON.parse(x); } catch {}
+  }
+  return x;
+}
+
+async function magSession(hostValue,macValue) {
+  const host=validateExternalSourceHost(hostValue);
+  const mac=String(macValue||"").trim().toUpperCase();
+  if(!/^([0-9A-F]{2}:){5}[0-9A-F]{2}$/.test(mac))
+    throw new Error("MAC adresi 00:11:22:33:44:55 biçiminde olmalı.");
+
+  const portal=new URL(host.href);
+  if(!portal.pathname.toLowerCase().endsWith("portal.php"))
+    portal.pathname=portal.pathname.replace(/\/+$/,"")+"/portal.php";
+
+  const cookie="mac="+mac+"; stb_lang=en; timezone=Europe%2FIstanbul";
+  const u=new URL(portal.href);
+  u.searchParams.set("type","stb");
+  u.searchParams.set("action","handshake");
+  u.searchParams.set("token","");
+  u.searchParams.set("JsHttpRequest","1-xml");
+
+  const response=await fetch(u.href,{
+    headers:{
+      "Cookie":cookie,
+      "User-Agent":"Mozilla/5.0 (QtEmbedded; Linux; U; Linux armv7l) AppleWebKit/533.3",
+      "X-User-Agent":"Model: MAG250; Link: Ethernet",
+      "Referer":portal.origin+"/c/"
+    },
+    redirect:"error"
+  });
+  if(!response.ok) throw new Error("MAG handshake HTTP "+response.status);
+  const text=await response.text();
+  let data;
+  try { data=JSON.parse(text); }
+  catch { throw new Error("MAG portal yanıtı JSON değil."); }
+
+  const js=magUnwrap(data);
+  const token=String(js?.token||data?.token||"");
+  if(!token) throw new Error("MAG portal token vermedi.");
+
+  const setCookie=response.headers.get("set-cookie")||"";
+  const php=(setCookie.match(/PHPSESSID=[^;]+/i)||[])[0]||"";
+  return {portal,mac,token,cookie:cookie+(php?"; "+php:"")};
+}
+
+async function magCall(session,params) {
+  const u=new URL(session.portal.href);
+  for(const [k,v] of Object.entries({
+    ...params,JsHttpRequest:"1-xml"
+  })) u.searchParams.set(k,String(v));
+
+  const response=await fetch(u.href,{
+    headers:{
+      "Cookie":session.cookie,
+      "Authorization":"Bearer "+session.token,
+      "User-Agent":"Mozilla/5.0 (QtEmbedded; Linux; U; Linux armv7l) AppleWebKit/533.3",
+      "X-User-Agent":"Model: MAG250; Link: Ethernet",
+      "Referer":session.portal.origin+"/c/"
+    },
+    redirect:"error"
+  });
+  if(!response.ok) throw new Error("MAG portal HTTP "+response.status);
+  const text=await response.text();
+  try { return JSON.parse(text); }
+  catch { throw new Error("MAG portal yanıtı okunamadı."); }
+}
+
+function magArray(value) {
+  const x=magUnwrap(value);
+  if(Array.isArray(x)) return x;
+  if(Array.isArray(x?.data)) return x.data;
+  if(Array.isArray(x?.channels)) return x.channels;
+  return [];
+}
+
+async function magGetChannels(session) {
+  const result=await magCall(session,{type:"itv",action:"get_all_channels"});
+  return magArray(result);
+}
+
+function magChannelId(row) {
+  return String(row.id||row.ch_id||row.channel_id||"");
+}
+
+async function handleMagCategories(body) {
+  const session=await magSession(body.host,body.mac);
+  const result=await magCall(session,{type:"itv",action:"get_genres"});
+  return magArray(result).map(x=>({
+    id:String(x.id||x.genre_id||""),
+    name:String(x.title||x.name||"Diğer")
+  })).filter(x=>x.id);
+}
+
+async function handleMagChannels(body) {
+  const session=await magSession(body.host,body.mac);
+  const genre=String(body.categoryId||"");
+  const channels=await magGetChannels(session);
+  return channels.filter(x=>
+    !genre || String(x.tv_genre_id||x.genre_id||x.category_id||"")===genre
+  ).slice(0,1000).map(x=>({
+    id:magChannelId(x),
+    name:String(x.name||x.title||"İsimsiz"),
+    logo:String(x.logo||x.screenshot_uri||""),
+    group:String(x.tv_genre_name||x.genre_name||"MAG"),
+    number:String(x.number||"")
+  })).filter(x=>x.id);
+}
+
+async function handleMagImport(body) {
+  const ids=Array.isArray(body.ids)?[...new Set(body.ids.map(String))]:[];
+  if(!ids.length||ids.length>200)
+    throw new Error("Bir aktarımda 1-200 kanal seç.");
+
+  const session=await magSession(body.host,body.mac);
+  const channels=await magGetChannels(session);
+  const wanted=new Set(ids);
+  const selected=channels.filter(x=>wanted.has(magChannelId(x)));
+  if(selected.length!==ids.length)
+    throw new Error("Seçilen kanalların bir kısmı portalda bulunamadı.");
+
+  const records=[];
+  for(const channel of selected) {
+    const cmd=String(channel.cmd||"");
+    if(!cmd) continue;
+
+    const result=await magCall(session,{
+      type:"itv",action:"create_link",cmd,
+      series:"0",forced_storage:"0",
+      disable_ad:"0",download:"0"
+    });
+    const js=magUnwrap(result);
+    const raw=String(js?.cmd||js?.url||js?.link||"");
+    const match=raw.match(/https?:\/\/[^\s"'<>]+/i);
+    if(!match) continue;
+
+    records.push({
+      id:uuid(),
+      source:"mag",
+      type:"live",
+      name:String(channel.name||"İsimsiz"),
+      url:match[0],
+      logo:String(channel.logo||channel.screenshot_uri||""),
+      group:String(channel.tv_genre_name||channel.genre_name||"MAG"),
+      channelId:magChannelId(channel),
+      number:String(channel.number||"")
+    });
+  }
+  return records;
+}
+
+async function handleSources(request, env, url, method) {
+  if (!checkGithubRepo(SOURCE_REPO, env)) {
+    return json({ ok: false, error: "Source repository is not allowed" }, 403);
+  }
+
+  // XTREAM_MAG_ROUTES_V1
+
+  if (method === "POST" && url.pathname === "/admin/sources/xtream/categories") {
+    try {
+      const body=await readJson(request);
+      if(!body) return json({ok:false,error:"Invalid JSON"},400);
+      return json({ok:true,categories:await handleXtreamCategories(body)});
+    } catch(e) {
+      return json({ok:false,error:String(e.message||"Xtream category request failed")},502);
+    }
+  }
+  if (method === "POST" && url.pathname === "/admin/sources/xtream/import") {
+    try {
+      const body=await readJson(request);
+      if(!body) return json({ok:false,error:"Invalid JSON"},400);
+      const items=await handleXtreamImport(body);
+      return json({ok:true,count:items.length,items});
+    } catch(e) {
+      return json({ok:false,error:String(e.message||"Xtream import failed")},502);
+    }
+  }
+  if (method === "POST" && url.pathname === "/admin/sources/mag/categories") {
+    try {
+      const body=await readJson(request);
+      if(!body) return json({ok:false,error:"Invalid JSON"},400);
+      return json({ok:true,categories:await handleMagCategories(body)});
+    } catch(e) {
+      return json({ok:false,error:String(e.message||"MAG category request failed")},502);
+    }
+  }
+  if (method === "POST" && url.pathname === "/admin/sources/mag/channels") {
+    try {
+      const body=await readJson(request);
+      if(!body) return json({ok:false,error:"Invalid JSON"},400);
+      return json({ok:true,items:await handleMagChannels(body)});
+    } catch(e) {
+      return json({ok:false,error:String(e.message||"MAG channel request failed")},502);
+    }
+  }
+  if (method === "POST" && url.pathname === "/admin/sources/mag/import") {
+    try {
+      const body=await readJson(request);
+      if(!body) return json({ok:false,error:"Invalid JSON"},400);
+      const items=await handleMagImport(body);
+      return json({ok:true,count:items.length,items});
+    } catch(e) {
+      return json({ok:false,error:String(e.message||"MAG import failed")},502);
+    }
+  }
+
+  if (method === "GET" && url.pathname === "/admin/sources") {
+    try {
+      const current = await sourceGetCurrent(env);
+      const offset = Math.max(0, Number(url.searchParams.get("offset") || 0));
+      const limit = Math.min(200, Math.max(1, Number(url.searchParams.get("limit") || 100)));
+      const records = await sourceReadRecords(env, current);
+      return json({
+        ok: true,
+        generation: current.manifest.generation,
+        total: records.length,
+        offset,
+        items: records.slice(offset, offset + limit)
+      });
+    } catch {
+      return json({ ok: false, error: "Source repository could not be read" }, 502);
+    }
+  }
+
+  if (method === "POST" && url.pathname === "/admin/sources/begin") {
+    const body = await readJson(request);
+    if (!body) return json({ ok: false, error: "Invalid JSON" }, 400);
+
+    const expectedParts = Number(body.expectedParts);
+    const sourceCount = Number(body.sourceCount);
+    if (!Number.isInteger(expectedParts) || expectedParts < 1 || expectedParts > 500 ||
+        !Number.isInteger(sourceCount) || sourceCount < 0 || sourceCount > 1000000) {
+      return json({ ok: false, error: "Invalid upload metadata" }, 400);
+    }
+
+    const generation = crypto.randomUUID().replace(/-/g, "");
+    try {
+      await sourceWrite(env, `${SOURCE_ROOT}/uploads/${generation}/meta.json`, {
+        generation, expectedParts, sourceCount,
+        createdAt: new Date().toISOString()
+      }, "Begin source upload");
+      return json({ ok: true, generation, expectedParts });
+    } catch {
+      return json({ ok: false, error: "Could not begin source upload" }, 502);
+    }
+  }
+
+  if (method === "PUT" && url.pathname === "/admin/sources/chunk") {
+    const body = await readJson(request);
+    if (!body) return json({ ok: false, error: "Invalid JSON" }, 400);
+
+    const generation = String(body.generation || "");
+    const index = Number(body.index);
+    const contentBase64 = String(body.contentBase64 || "");
+    if (!/^[a-f0-9]{32}$/.test(generation) ||
+        !Number.isInteger(index) || index < 0 || index >= 500 ||
+        !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(contentBase64) ||
+        Math.floor(contentBase64.length * 3 / 4) > SOURCE_PART_LIMIT) {
+      return json({ ok: false, error: "Invalid source chunk" }, 400);
+    }
+
+    try {
+      const meta = await sourceRead(env, `${SOURCE_ROOT}/uploads/${generation}/meta.json`);
+      if (index >= meta.expectedParts) {
+        return json({ ok: false, error: "Chunk index out of range" }, 400);
+      }
+      const raw = decoder.decode(Uint8Array.from(
+        atob(contentBase64), c => c.charCodeAt(0)
+      ));
+      const rows = JSON.parse(raw);
+      if (!Array.isArray(rows)) throw new Error("Chunk must contain an array");
+
+      await sourceWrite(
+        env,
+        `${SOURCE_ROOT}/uploads/${generation}/part-${String(index).padStart(5, "0")}.json`,
+        raw,
+        "Upload source chunk"
+      );
+      return json({ ok: true, generation, index, count: rows.length });
+    } catch {
+      return json({ ok: false, error: "Source chunk upload failed" }, 502);
+    }
+  }
+
+  if (method === "POST" && url.pathname === "/admin/sources/complete") {
+    const body = await readJson(request);
+    const generation = String(body?.generation || "");
+    if (!/^[a-f0-9]{32}$/.test(generation)) {
+      return json({ ok: false, error: "Invalid generation" }, 400);
+    }
+
+    try {
+      const meta = await sourceRead(env, `${SOURCE_ROOT}/uploads/${generation}/meta.json`);
+      const base = `${SOURCE_ROOT}/uploads/${generation}`;
+      const parts = [];
+      let total = 0;
+
+      for (let i = 0; i < meta.expectedParts; i++) {
+        const name = `part-${String(i).padStart(5, "0")}.json`;
+        const rows = await sourceRead(env, `${base}/${name}`);
+        if (!Array.isArray(rows)) throw new Error("Invalid part");
+        total += rows.length;
+        parts.push(name);
+      }
+
+      if (total !== meta.sourceCount) {
+        return json({ ok: false, error: "Source count does not match", expected: meta.sourceCount, actual: total }, 409);
+      }
+
+      const manifest = {
+        generation, parts, count: total,
+        createdAt: new Date().toISOString()
+      };
+      const finalBase = `${SOURCE_ROOT}/generations/${generation}`;
+
+      for (const name of parts) {
+        const rows = await sourceRead(env, `${base}/${name}`);
+        await sourceWrite(env, `${finalBase}/${name}`, rows, "Copy verified source part");
+      }
+
+      await sourceWrite(env, `${finalBase}/manifest.json`, manifest, "Publish verified source manifest");
+      await sourceWrite(
+        env, `${SOURCE_ROOT}/current.json`,
+        { generation, updatedAt: new Date().toISOString() },
+        "Activate verified source generation"
+      );
+
+      await audit(env, "sources_generation_published", generation, { count: total });
+      return json({ ok: true, generation, count: total });
+    } catch {
+      return json({ ok: false, error: "Upload verification or publication failed" }, 502);
+    }
+  }
+
+  if (method === "POST" && url.pathname === "/admin/sources/delete") {
+    const body = await readJson(request);
+    const ids = Array.isArray(body?.ids)
+      ? [...new Set(body.ids.map(x => String(x)).filter(x => x && x.length <= 200))]
+      : [];
+
+    if (!ids.length) return json({ ok: false, error: "No source selected" }, 400);
+    if (ids.length > 10000) return json({ ok: false, error: "Too many selected sources" }, 400);
+
+    try {
+      const current = await sourceGetCurrent(env);
+      const records = await sourceReadRecords(env, current);
+      const selected = new Set(ids);
+      const kept = records.filter(row => !selected.has(String(row.id || "")));
+      const removed = records.length - kept.length;
+
+      if (!removed) return json({ ok: true, deleted: 0, total: records.length });
+
+      const manifest = await sourcePublishRecords(env, kept);
+      await audit(env, "sources_selected_deleted", manifest.generation, { deleted: removed });
+      return json({ ok: true, deleted: removed, total: kept.length, generation: manifest.generation });
+    } catch {
+      return json({ ok: false, error: "Selected source deletion failed" }, 502);
+    }
+  }
+
+  return json({ ok: false, error: "Source endpoint not found" }, 404);
+}
+
 
 async function handleGithub(request, env, url, method) {
   if (method === "GET" && url.pathname === "/admin/github/repos") {
@@ -1697,158 +1507,6 @@ async function handleGithub(request, env, url, method) {
   return json({ ok: false, error: "GitHub endpoint not found" }, 404);
 }
 
-/* =========================================================
-   MEMBER API
-   ========================================================= */
-
-async function handleMember(request, env, path, method, auth) {
-  const member = auth.member;
-
-  if (method === "GET" && path === "/member/profile") {
-    return json({
-      ok: true,
-      member: {
-        id: member.id,
-        member_code: member.member_code,
-        display_name: member.display_name,
-        status: member.status,
-        expires_at: member.expires_at,
-        max_devices: member.max_devices
-      }
-    });
-  }
-
-  if (method === "GET" && path === "/member/messages") {
-    const result = await env.DB.prepare(`
-      SELECT id, title, body, created_at, expires_at
-      FROM messages
-      WHERE (member_id IS NULL OR member_id = ?)
-        AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
-      ORDER BY created_at DESC
-      LIMIT 100
-    `).bind(member.id).all();
-
-    return json({ ok: true, messages: result.results || [] });
-  }
-
-  if (method === "GET" && path === "/member/streams") {
-    const result = await env.DB.prepare(`
-      SELECT id, name, source_type
-      FROM stream_sources
-      WHERE status = 'active'
-      ORDER BY name
-      LIMIT 500
-    `).all();
-
-    return json({ ok: true, streams: result.results || [] });
-  }
-
-  if (method === "GET" && path === "/member/broadcast") {
-    const result = await env.DB.prepare(`
-      SELECT b.id, b.title, b.message, b.started_at,
-             s.name AS stream_name
-      FROM broadcasts b
-      JOIN stream_sources s ON s.id = b.stream_source_id
-      WHERE b.status = 'live'
-        AND s.status = 'active'
-        AND EXISTS (
-          SELECT 1
-          FROM broadcast_recipients r
-          WHERE r.broadcast_id = b.id
-            AND r.member_id = ?
-            AND r.status IN ('targeted', 'authorized')
-        )
-      ORDER BY b.started_at DESC
-      LIMIT 20
-    `).bind(member.id).all();
-
-    return json({ ok: true, broadcasts: result.results || [] });
-  }
-
-  if (method === "POST" && path === "/member/playback") {
-    const body = await readJson(request);
-    if (!body) return json({ ok: false, error: "Invalid JSON" }, 400);
-
-    if (!body.broadcast_id) {
-      return json({
-        ok: false,
-        error: "An active broadcast is required"
-      }, 400);
-    }
-
-    let source;
-    const broadcastId = String(body.broadcast_id).trim();
-
-    if (!broadcastId || broadcastId.length > 180) {
-      return json({ ok: false, error: "Invalid broadcast ID" }, 400);
-    }
-
-    {
-
-      const broadcast = await env.DB.prepare(`
-        SELECT b.id, b.stream_source_id, b.audience,
-               s.id AS source_id, s.source_url, s.status AS source_status
-        FROM broadcasts b
-        JOIN stream_sources s ON s.id = b.stream_source_id
-        WHERE b.id = ? AND b.status = 'live'
-        LIMIT 1
-      `).bind(broadcastId).first();
-
-      if (!broadcast || broadcast.source_status !== "active") {
-        return json({ ok: false, error: "Broadcast unavailable" }, 404);
-      }
-
-      const recipient = await env.DB.prepare(`
-        SELECT id
-        FROM broadcast_recipients
-        WHERE broadcast_id = ?
-          AND member_id = ?
-          AND status IN ('targeted', 'authorized')
-        LIMIT 1
-      `).bind(broadcastId, member.id).first();
-
-      if (!recipient) {
-        return json({ ok: false, error: "Not authorized for broadcast" }, 403);
-      }
-
-      await env.DB.prepare(`
-        UPDATE broadcast_recipients
-        SET status = 'authorized', authorized_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-      `).bind(recipient.id).run();
-
-      source = {
-        id: broadcast.source_id,
-        source_url: broadcast.source_url,
-        status: broadcast.source_status
-      };
-    }
-
-    if (!source) {
-      return json({ ok: false, error: "Stream not found" }, 404);
-    }
-
-    const playback = await issuePlayback(
-      env,
-      member,
-      auth.deviceId,
-      source,
-      broadcastId
-    );
-
-    if (playback.error) {
-      return json({ ok: false, error: playback.error }, 403);
-    }
-
-    return json({ ok: true, ...playback });
-  }
-
-  return json({ ok: false, error: "Member endpoint not found" }, 404);
-}
-
-/* =========================================================
-   MAIN ROUTER
-   ========================================================= */
 
 export default {
   async fetch(request, env) {
@@ -1868,73 +1526,68 @@ export default {
 
     const cors = {
       "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, OPTIONS",
-      "Access-Control-Allow-Headers": "Authorization, Content-Type, Range",
-      "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges",
+      "Access-Control-Allow-Headers": "Authorization, Content-Type",
       "Vary": "Origin"
     };
 
     if (allowOrigin) cors["Access-Control-Allow-Origin"] = allowOrigin;
 
     if (method === "OPTIONS") {
-      return new Response(null, {
-        status: 204,
-        headers: cors
-      });
+      return new Response(null, { status: 204, headers: cors });
     }
 
     try {
       if (path === "/health" && method === "GET") {
         return json({
           ok: true,
-          version: VERSION,
-          service: "stream-access-service"
+          version: "1.0.0",
+          service: "admin-control-service"
         }, 200, cors);
       }
 
-      if (path.startsWith("/play/") && method === "GET") {
-        const ticket = path.slice("/play/".length);
-        return proxyMedia(request, env, ticket, cors);
-      }
-
-      if (path.startsWith("/p/") && method === "GET") {
-        const ticket = path.slice("/p/".length);
-        return proxyMedia(request, env, ticket, cors);
-      }
-
-      if (path.startsWith("/auth/") && method === "POST") {
-        return handleLogin(request, env, path);
+      if (path === "/auth/admin/login" && method === "POST") {
+        const response = await handleAdminLogin(request, env);
+        const headers = new Headers(response.headers);
+        for (const [key, value] of Object.entries(cors)) {
+          headers.set(key, value);
+        }
+        return new Response(response.body, {
+          status: response.status,
+          headers
+        });
       }
 
       if (path.startsWith("/admin/")) {
         const admin = await adminAuth(request, env);
+
         if (!admin) {
           return json({ ok: false, error: "Unauthorized" }, 401, cors);
         }
 
-        if (path.startsWith("/admin/github/")) {
-          return handleGithub(request, env, url, method);
+        const response = path.startsWith("/admin/github/")
+          ? await handleGithub(request, env, url, method)
+          : (path === "/admin/sources" || path.startsWith("/admin/sources/"))
+            ? await handleSources(request, env, url, method)
+            : await handleAdmin(request, env, path, method);
+
+        const headers = new Headers(response.headers);
+        for (const [key, value] of Object.entries(cors)) {
+          headers.set(key, value);
         }
 
-        return handleAdmin(request, env, path, method);
-      }
-
-      if (path.startsWith("/member/")) {
-        const auth = await memberAuth(request, env);
-        if (!auth) {
-          return json({ ok: false, error: "Unauthorized" }, 401, cors);
-        }
-
-        return handleMember(request, env, path, method, auth);
+        return new Response(response.body, {
+          status: response.status,
+          headers
+        });
       }
 
       return json({ ok: false, error: "Not found" }, 404, cors);
     } catch (error) {
-      // Safe diagnostics: never log request bodies, passwords or tokens.
-      console.error("WORKER_REQUEST_ERROR", JSON.stringify({
+      console.error("ADMIN_WORKER_ERROR", JSON.stringify({
         path,
         method,
         name: error?.name || "Error",
-        message: String(error?.message || error).slice(0, 1000)
+        message: String(error?.message || error).slice(0, 500)
       }));
 
       return json({
@@ -1944,3 +1597,4 @@ export default {
     }
   }
 };
+
