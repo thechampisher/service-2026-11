@@ -1807,7 +1807,14 @@ export default {
 
       return json({ ok: false, error: "Not found" }, 404, cors);
     } catch (error) {
-      // Never return stack traces, tokens, SQL or source URLs to clients.
+      // Safe diagnostics: never log request bodies, passwords or tokens.
+      console.error("WORKER_REQUEST_ERROR", JSON.stringify({
+        path,
+        method,
+        name: error?.name || "Error",
+        message: String(error?.message || error).slice(0, 1000)
+      }));
+
       return json({
         ok: false,
         error: "Internal server error"
