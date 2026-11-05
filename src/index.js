@@ -1113,10 +1113,6 @@ async function handleMagImport(body) {
 }
 
 async function handleSources(request, env, url, method) {
-  if (!checkGithubRepo(SOURCE_REPO, env)) {
-    return json({ ok: false, error: "Source repository is not allowed" }, 403);
-  }
-
   // XTREAM_MAG_ROUTES_V1
 
   if (method === "POST" && url.pathname === "/admin/sources/xtream/categories") {
