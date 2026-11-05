@@ -787,7 +787,7 @@ async function externalJson(url, headers={}) {
     const response=await fetch(url,{
       method:"GET",
       headers,
-      redirect:"error",
+      redirect:"manual",
       signal:controller.signal
     });
     if(!response.ok) throw new Error("Kaynak sunucu HTTP "+response.status);
@@ -1048,7 +1048,7 @@ async function magSession(hostValue,macValue) {
       "X-User-Agent":"Model: MAG250; Link: Ethernet",
       "Referer":portal.origin+"/c/"
     },
-    redirect:"error"
+    redirect:"manual"
   });
   if(!response.ok) throw new Error("MAG handshake HTTP "+response.status);
   const text=await response.text();
@@ -1079,7 +1079,7 @@ async function magCall(session,params) {
       "X-User-Agent":"Model: MAG250; Link: Ethernet",
       "Referer":session.portal.origin+"/c/"
     },
-    redirect:"error"
+    redirect:"manual"
   });
   if(!response.ok) throw new Error("MAG portal HTTP "+response.status);
   const text=await response.text();
@@ -1356,6 +1356,35 @@ async function handleSources(request, env, url, method) {
       return json({ ok: true, generation, count: total });
     } catch {
       return json({ ok: false, error: "Upload verification or publication failed" }, 502);
+    }
+  }
+
+  if (method === "POST" && url.pathname === "/admin/sources/delete-all") {
+    try {
+      const current = await sourceGetCurrent(env);
+      const records = await sourceReadRecords(env, current);
+      const removed = records.length;
+
+      if (!removed) {
+        return json({ ok: true, deleted: 0, total: 0 });
+      }
+
+      const manifest = await sourcePublishRecords(env, []);
+      await audit(env, "sources_all_deleted", manifest.generation, {
+        deleted: removed
+      });
+
+      return json({
+        ok: true,
+        deleted: removed,
+        total: 0,
+        generation: manifest.generation
+      });
+    } catch (error) {
+      return json({
+        ok: false,
+        error: "All source deletion failed"
+      }, 502);
     }
   }
 
