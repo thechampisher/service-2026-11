@@ -269,7 +269,7 @@ function allowedSource(raw, env) {
   try {
     const url = new URL(raw);
 
-    if (url.protocol !== "https:") return false;
+    if (!["http:", "https:"].includes(url.protocol)) return false;
     if (url.username || url.password) return false;
 
     const host = url.hostname.toLowerCase();
