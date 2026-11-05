@@ -925,8 +925,8 @@ async function handleXtreamImportFromUrl(body) {
     throw new Error("Xtream sunucusunda kategori bulunamadı.");
   }
 
-  if (categories.length > 250) {
-    throw new Error("Kategori sayısı 250 sınırını aşıyor.");
+  if (categories.length > 800) {
+    throw new Error("Kategori sayısı 800 sınırını aşıyor.");
   }
 
   return handleXtreamImport({
@@ -938,8 +938,8 @@ async function handleXtreamImportFromUrl(body) {
 async function handleXtreamImport(body) {
   const info=sourceCredentials(body);
   const selected=Array.isArray(body.categories)?body.categories:[];
-  if(!selected.length||selected.length>250)
-    throw new Error("En fazla 250 kategori seçilebilir.");
+  if(!selected.length||selected.length>800)
+    throw new Error("En fazla 800 kategori aktarılabilir.");
 
   const records=[];
   for(const category of selected) {
