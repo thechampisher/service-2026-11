@@ -877,11 +877,69 @@ async function handleXtreamCategories(body) {
   return categories;
 }
 
+function xtreamCredentialsFromPlaylistUrl(value) {
+  let playlist;
+  try {
+    playlist = new URL(String(value || ""));
+  } catch {
+    throw new Error("M3U/Xtream adresi geçerli değil.");
+  }
+
+  if (playlist.protocol !== "https:") {
+    throw new Error("Xtream adresi HTTPS olmalı.");
+  }
+
+  const user = String(playlist.searchParams.get("username") || "").trim();
+  const pass = String(playlist.searchParams.get("password") || "");
+
+  if (!user || !pass) {
+    throw new Error("URL içinde username ve password bilgileri bulunamadı.");
+  }
+
+  playlist.pathname = playlist.pathname.replace(
+    /\/(?:get|playlist|player_api)\.php$/i, ""
+  ).replace(/\/+$/, "") || "/";
+
+  playlist.search = "";
+  playlist.hash = "";
+
+  const host = validateExternalSourceHost(playlist.href);
+  return sourceCredentials({
+    host: host.href,
+    username: user,
+    password: pass
+  });
+}
+
+async function handleXtreamImportFromUrl(body) {
+  const info = xtreamCredentialsFromPlaylistUrl(body.playlistUrl);
+  const credentials = {
+    host: info.host.href,
+    username: info.user,
+    password: info.pass
+  };
+
+  const categories = await handleXtreamCategories(credentials);
+
+  if (!categories.length) {
+    throw new Error("Xtream sunucusunda kategori bulunamadı.");
+  }
+
+  if (categories.length > 250) {
+    throw new Error("Kategori sayısı 250 sınırını aşıyor.");
+  }
+
+  return handleXtreamImport({
+    ...credentials,
+    categories
+  });
+}
+
 async function handleXtreamImport(body) {
   const info=sourceCredentials(body);
   const selected=Array.isArray(body.categories)?body.categories:[];
-  if(!selected.length||selected.length>60)
-    throw new Error("En fazla 60 kategori seçilebilir.");
+  if(!selected.length||selected.length>250)
+    throw new Error("En fazla 250 kategori seçilebilir.");
 
   const records=[];
   for(const category of selected) {
@@ -1122,6 +1180,16 @@ async function handleSources(request, env, url, method) {
       return json({ok:true,categories:await handleXtreamCategories(body)});
     } catch(e) {
       return json({ok:false,error:String(e.message||"Xtream category request failed")},502);
+    }
+  }
+  if (method === "POST" && url.pathname === "/admin/sources/xtream/import-url") {
+    try {
+      const body = await readJson(request);
+      if (!body) return json({ok:false,error:"Invalid JSON"},400);
+      const items = await handleXtreamImportFromUrl(body);
+      return json({ok:true,count:items.length,items});
+    } catch(e) {
+      return json({ok:false,error:String(e.message||"Xtream URL import failed")},502);
     }
   }
   if (method === "POST" && url.pathname === "/admin/sources/xtream/import") {
