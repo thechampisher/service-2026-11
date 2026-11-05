@@ -885,7 +885,7 @@ function xtreamCredentialsFromPlaylistUrl(value) {
     throw new Error("M3U/Xtream adresi geçerli değil.");
   }
 
-  if (playlist.protocol !== "https:") {
+  if (playlist.protocol !== "https:" && playlist.protocol !== "http:") {
     throw new Error("Xtream adresi HTTPS olmalı.");
   }
 
