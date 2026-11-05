@@ -2,7 +2,7 @@ const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
 const VERSION = "2.0.0";
-const MEMBER_TOKEN_SECONDS = 8 * 60 * 60;
+const MEMBER_TOKEN_SECONDS = 10 * 365 * 24 * 60 * 60;
 const ADMIN_TOKEN_SECONDS = 8 * 60 * 60;
 const PLAYBACK_TOKEN_SECONDS = 120;
 const PLAYBACK_SESSION_SECONDS = 12 * 60 * 60;
@@ -303,17 +303,28 @@ function allowedSource(raw, env) {
       return true;
     }
 
+    // IPv6 adresleri şimdilik kabul edilmez.
     if (host.includes(":")) return false;
 
-    const allowlist = (env.STREAM_ALLOWED_HOSTS || "")
-      .split(",")
-      .map(x => x.trim().toLowerCase())
-      .filter(Boolean);
+    // Özel alan adları ve yerel ağ adları kabul edilmez.
+    if (
+      host === "localhost" ||
+      host.endsWith(".localhost") ||
+      host.endsWith(".local") ||
+      host.endsWith(".internal")
+    ) return false;
 
-    if (!allowlist.length) return false;
+    // Önceden tanımlı izin listesi olmadan genel DNS alan adlarını kabul et.
+    // URL uzantısı ve query parametreleri burada filtrelenmez.
+    if (host.length > 253) return false;
 
-    return allowlist.some(domain =>
-      host === domain || host.endsWith("." + domain)
+    const labels = host.split(".");
+    if (labels.length < 2) return false;
+
+    return labels.every(label =>
+      label.length >= 1 &&
+      label.length <= 63 &&
+      /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i.test(label)
     );
   } catch {
     return false;
@@ -577,23 +588,72 @@ async function proxyMedia(request, env, token, cors = {}) {
     "User-Agent": "MediaProxy/2.0"
   });
 
+  try {
+    const sourceHost = new URL(payload.url).hostname.toLowerCase();
+    if (sourceHost === "andro.evrenesoglu101.click") {
+      headers.set("Referer", "https://taraftarium24.xyz/");
+      headers.set("Origin", "https://taraftarium24.xyz");
+    }
+  } catch (_) {}
+
+
   const range = request.headers.get("Range");
   if (range) headers.set("Range", range);
 
   let upstream;
+  let currentUrl = payload.url;
 
-  try {
-    upstream = await fetch(payload.url, {
-      method: "GET",
-      headers,
-      redirect: "manual"
-    });
-  } catch {
-    return respondJson({ ok: false, error: "Upstream unavailable" }, 502);
+  // Yönlendirmeleri kontrollü takip et.
+  // Her yeni adres yeniden doğrulanır.
+  for (let redirectCount = 0; redirectCount <= 5; redirectCount++) {
+    if (!allowedSource(currentUrl, env)) {
+      return respondJson({
+        ok: false,
+        error: "Redirect source is not permitted"
+      }, 502);
+    }
+
+    try {
+      upstream = await fetch(currentUrl, {
+        method: "GET",
+        headers,
+        redirect: "manual"
+      });
+    } catch {
+      return respondJson({
+        ok: false,
+        error: "Upstream unavailable"
+      }, 502);
+    }
+
+    if (upstream.status < 300 || upstream.status >= 400) {
+      break;
+    }
+
+    const location = upstream.headers.get("Location");
+
+    if (!location || redirectCount === 5) {
+      return respondJson({
+        ok: false,
+        error: "Redirect limit exceeded"
+      }, 502);
+    }
+
+    try {
+      currentUrl = new URL(location, currentUrl).toString();
+    } catch {
+      return respondJson({
+        ok: false,
+        error: "Invalid redirect address"
+      }, 502);
+    }
   }
 
-  if (upstream.status >= 300 && upstream.status < 400) {
-    return respondJson({ ok: false, error: "Upstream redirects are not allowed" }, 502);
+  if (!upstream || (upstream.status >= 300 && upstream.status < 400)) {
+    return respondJson({
+      ok: false,
+      error: "Upstream redirect failed"
+    }, 502);
   }
 
   if (!upstream.ok && upstream.status !== 206) {
@@ -601,7 +661,7 @@ async function proxyMedia(request, env, token, cors = {}) {
   }
 
   const contentType = upstream.headers.get("Content-Type") || "";
-  const manifest = isManifest(payload.url, contentType);
+  const manifest = isManifest(currentUrl, contentType);
 
   if (manifest) {
     // Uzantısı tanınmayan alt oynatma listeleri ancak upstream
@@ -638,7 +698,7 @@ async function proxyMedia(request, env, token, cors = {}) {
     try {
       rewritten = await rewriteManifest(
         sourceText,
-        payload.url,
+        currentUrl,
         env,
         {
           sid: payload.sid,
