@@ -167,11 +167,11 @@ async function hashPassword(password) {
   const result = await crypto.subtle.deriveBits({
     name: "PBKDF2",
     salt,
-    iterations: 210000,
+    iterations: 100000,
     hash: "SHA-256"
   }, key, 256);
 
-  return `pbkdf2$210000$${b64url(salt)}$${b64url(new Uint8Array(result))}`;
+  return `pbkdf2$100000$${b64url(salt)}$${b64url(new Uint8Array(result))}`;
 }
 
 async function checkPassword(password, stored) {
@@ -182,7 +182,7 @@ async function checkPassword(password, stored) {
     const iterations = Number(parts[1]);
     if (!Number.isInteger(iterations) ||
         iterations < 100000 ||
-        iterations > 500000) return false;
+        iterations > 100000) return false;
 
     const salt = unb64url(parts[2]);
     const expected = unb64url(parts[3]);
