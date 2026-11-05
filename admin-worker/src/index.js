@@ -1016,6 +1016,104 @@ async function handleXtreamImport(body) {
   return records;
 }
 
+
+// XTREAM_BATCH_IMPORT_V1
+// Her çağrıda bir kategori ve en fazla 8 dizi ayrıntısı işlenir.
+async function handleXtreamImportPart(body) {
+  const info = sourceCredentials(body);
+  const category = body.category || {};
+  const type = String(category.type || "");
+  const id = String(category.id || "");
+  const name = String(category.name || "Diğer");
+
+  if (!["live", "vod", "series"].includes(type) || !id) {
+    throw new Error("Geçersiz Xtream kategorisi.");
+  }
+
+  const action = type === "live" ? "get_live_streams" :
+    type === "vod" ? "get_vod_streams" : "get_series";
+
+  const rows = arrayValue(await xtreamAction(info, action, id));
+
+  if (type !== "series") {
+    const items = [];
+    for (const row of rows) {
+      const record = xtreamStreamRecord(
+        info, row, type === "live" ? "live" : "movie", name
+      );
+      if (record) items.push(record);
+    }
+    return { items, total: rows.length, nextOffset: rows.length, done: true };
+  }
+
+  const offset = Math.max(0, Number(body.offset) || 0);
+  const batchSize = Math.min(8, Math.max(1, Number(body.batchSize) || 8));
+  const batch = rows.slice(offset, offset + batchSize);
+  const items = [];
+
+  for (const series of batch) {
+    const sid = String(series.series_id || series.id || "");
+    if (!sid) continue;
+
+    const detail = await xtreamAction(info, "get_series_info", null, sid);
+    const seasons = detail?.episodes || {};
+    let found = 0;
+
+    for (const seasonKey of Object.keys(seasons)) {
+      for (const ep of arrayValue(seasons[seasonKey])) {
+        const eid = String(ep.id || ep.episode_id || "");
+        if (!eid) continue;
+
+        const ext = String(ep.container_extension || "mkv")
+          .toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 8) || "mkv";
+        const epNo = ep.episode_num || ep.episode_number || "";
+        const title = String(ep.title || ep.name || "Bölüm");
+
+        items.push({
+          id: uuid(),
+          source: "xtream",
+          type: "episode",
+          name: String(series.name || "Dizi") + " - S" +
+            String(seasonKey) + " E" + String(epNo) + " - " + title,
+          seriesName: String(series.name || ""),
+          season: String(seasonKey),
+          episode: String(epNo),
+          url: info.host.origin +
+            info.host.pathname.replace(/\/player_api\.php$/i, "") +
+            "/series/" + encodeURIComponent(info.user) + "/" +
+            encodeURIComponent(info.pass) + "/" +
+            encodeURIComponent(eid) + "." + ext,
+          logo: String(ep.info?.movie_image || series.cover || ""),
+          group: name,
+          seriesId: sid
+        });
+        found++;
+      }
+    }
+
+    if (!found) {
+      items.push({
+        id: uuid(),
+        source: "xtream",
+        type: "series",
+        name: String(series.name || "İsimsiz"),
+        url: "",
+        logo: String(series.cover || ""),
+        group: name,
+        seriesId: sid
+      });
+    }
+  }
+
+  const nextOffset = offset + batch.length;
+  return {
+    items,
+    total: rows.length,
+    nextOffset,
+    done: nextOffset >= rows.length
+  };
+}
+
 function magUnwrap(value) {
   let x=value?.js??value;
   if(typeof x==="string") {
@@ -1192,6 +1290,18 @@ async function handleSources(request, env, url, method) {
       return json({ok:false,error:String(e.message||"Xtream URL import failed")},502);
     }
   }
+
+  if (method === "POST" && url.pathname === "/admin/sources/xtream/import-part") {
+    try {
+      const body = await readJson(request);
+      if (!body) return json({ok:false,error:"Invalid JSON"},400);
+      const result = await handleXtreamImportPart(body);
+      return json({ok:true,...result});
+    } catch(e) {
+      return json({ok:false,error:String(e.message || "Xtream batch import failed")},502);
+    }
+  }
+
   if (method === "POST" && url.pathname === "/admin/sources/xtream/import") {
     try {
       const body=await readJson(request);
