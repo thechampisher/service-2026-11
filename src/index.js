@@ -279,7 +279,30 @@ function allowedSource(raw, env) {
         host.endsWith(".local") ||
         host.endsWith(".internal")) return false;
 
-    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return false;
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) {
+      const parts = host.split(".").map(Number);
+      if (parts.some(x => x < 0 || x > 255)) return false;
+
+      const [a, b, c, d] = parts;
+
+      if (
+        a === 0 || a === 10 || a === 127 ||
+        a >= 224 ||
+        (a === 100 && b >= 64 && b <= 127) ||
+        (a === 169 && b === 254) ||
+        (a === 172 && b >= 16 && b <= 31) ||
+        (a === 192 && b === 168) ||
+        (a === 192 && b === 0 && c === 0) ||
+        (a === 192 && b === 0 && c === 2) ||
+        (a === 198 && (b === 18 || b === 19)) ||
+        (a === 198 && b === 51 && c === 100) ||
+        (a === 203 && b === 0 && c === 113) ||
+        (a === 255 && b === 255 && c === 255 && d === 255)
+      ) return false;
+
+      return true;
+    }
+
     if (host.includes(":")) return false;
 
     const allowlist = (env.STREAM_ALLOWED_HOSTS || "")
