@@ -1,0 +1,117 @@
+name: Network Check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check catalog connectivity
+        run: |
+          python3 - <<'PY'
+          import json, time, urllib.request, urllib.error
+
+          now = int(time.time() * 1000)
+          lang = "de"
+
+          ping = {
+              "reason": "app-focus",
+              "locale": lang,
+              "theme": "dark",
+              "metadata": {
+                  "device": {"type": "desktop", "uniqueId": f"gh-{now}"},
+                  "os": {"name": "linux", "version": "Linux", "abis": ["x64"], "host": "node"},
+                  "app": {"platform": "electron"},
+                  "version": {"package": "tv.vavoo.app", "binary": "3.1.8", "js": "3.1.8"}
+              },
+              "appFocusTime": 0,
+              "playerActive": False,
+              "playDuration": 0,
+              "devMode": False,
+              "hasAddon": True,
+              "castConnected": False,
+              "package": "tv.vavoo.app",
+              "version": "3.1.8",
+              "process": "app",
+              "firstAppStart": now,
+              "lastAppStart": now,
+              "ipLocation": None,
+              "adblockEnabled": True,
+              "proxy": {"supported": ["ss"], "engine": "Mu", "enabled": False, "autoServer": True},
+              "iap": {"supported": False}
+          }
+
+          def post(url, data, headers):
+              req = urllib.request.Request(
+                  url,
+                  data=json.dumps(data).encode(),
+                  headers=headers,
+                  method="POST"
+              )
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  raw = response.read()
+                  return response.status, raw
+
+          try:
+              status, raw = post(
+                  "https://www.vavoo.tv/api/app/ping",
+                  ping,
+                  {
+                      "Content-Type": "application/json",
+                      "User-Agent": "MediaHubMX/2",
+                      "Accept": "*/*"
+                  }
+              )
+              signature = json.loads(raw).get("addonSig")
+              print("PING:", status, "SIGNATURE:", "OK" if signature else "MISSING")
+
+              if not signature:
+                  raise RuntimeError("Signature missing")
+
+              headers = {
+                  "Content-Type": "application/json; charset=utf-8",
+                  "mediahubmx-signature": signature,
+                  "User-Agent": "MediaHubMX/2",
+                  "Accept": "*/*",
+                  "Accept-Language": lang,
+                  "Connection": "close"
+              }
+
+              payload = {
+                  "language": lang,
+                  "region": "TR",
+                  "catalogId": "iptv",
+                  "id": "iptv",
+                  "adult": False,
+                  "search": "",
+                  "sort": "",
+                  "filter": {},
+                  "cursor": None,
+                  "clientVersion": "3.0.2"
+              }
+
+              for host in ("vavoo.to", "kool.to"):
+                  url = f"https://{host}/mediahubmx-catalog.json"
+                  print("\nHOST:", host)
+                  try:
+                      status, raw = post(url, payload, headers)
+                      data = json.loads(raw)
+                      items = data.get("items", [])
+                      print("HTTP:", status)
+                      print("ITEMS:", len(items))
+                      print("NEXT PAGE:", bool(data.get("nextCursor")))
+                      groups = sorted(set(str(x.get("group", "")) for x in items))
+                      print("GROUPS:", json.dumps(groups[:80], ensure_ascii=False))
+                  except Exception as error:
+                      print("FAILED:", type(error).__name__, str(error)[:250])
+
+          except Exception as error:
+              print("PING FAILED:", type(error).__name__, str(error)[:250])
+              raise
+          PY
