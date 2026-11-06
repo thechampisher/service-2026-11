@@ -1,0 +1,1629 @@
+
+
+===========================================================================
+DOSYA: migrations/0001_initial.sql
+===========================================================================
+
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS members (
+    id TEXT PRIMARY KEY,
+    member_code TEXT NOT NULL UNIQUE,
+    display_name TEXT,
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK(status IN ('active','inactive','blocked')),
+    max_devices INTEGER NOT NULL DEFAULT 1,
+    expires_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS devices (
+    id TEXT PRIMARY KEY,
+    member_id TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    device_name TEXT,
+    token_hash TEXT,
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK(status IN ('active','blocked')),
+    paired_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_seen TEXT,
+    FOREIGN KEY(member_id) REFERENCES members(id) ON DELETE CASCADE,
+    UNIQUE(member_id, device_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_devices_member
+ON devices(member_id);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id TEXT PRIMARY KEY,
+    member_id TEXT,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    expires_at TEXT NOT NULL,
+    FOREIGN KEY(member_id) REFERENCES members(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_member
+ON messages(member_id, expires_at);
+
+CREATE TABLE IF NOT EXISTS app_config (
+    config_key TEXT PRIMARY KEY,
+    config_value TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS catalog_releases (
+    id TEXT PRIMARY KEY,
+    version TEXT NOT NULL UNIQUE,
+    manifest_url TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    total_bytes INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'draft'
+        CHECK(status IN ('draft','published','retired')),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    published_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS download_jobs (
+    id TEXT PRIMARY KEY,
+    release_id TEXT NOT NULL,
+    batch_no INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued'
+        CHECK(status IN ('queued','running','completed','failed','cancelled')),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(release_id) REFERENCES catalog_releases(id) ON DELETE CASCADE,
+    UNIQUE(release_id, batch_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_status
+ON download_jobs(status, created_at);
+
+CREATE TABLE IF NOT EXISTS device_downloads (
+    id TEXT PRIMARY KEY,
+    device_id TEXT NOT NULL,
+    release_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued'
+        CHECK(status IN ('queued','authorized','downloading','completed','failed')),
+    authorized_at TEXT,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(release_id) REFERENCES catalog_releases(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_device_downloads_status
+ON device_downloads(status, updated_at);
+
+
+
+===========================================================================
+DOSYA: migrations/0002_secure_auth.sql
+===========================================================================
+
+ALTER TABLE members ADD COLUMN password_hash TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_members_member_code
+ON members(member_code);
+
+CREATE INDEX IF NOT EXISTS idx_devices_member_status
+ON devices(member_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_messages_expiry
+ON messages(expires_at);
+
+
+
+===========================================================================
+DOSYA: migrations/0003_stream_security.sql
+===========================================================================
+
+PRAGMA foreign_keys = ON;
+
+-- =========================================================
+-- YAYIN KAYNAKLARI
+-- Gerçek kaynak adresleri yalnızca sunucu tarafında tutulur.
+-- Üye API yanıtlarında source_url kesinlikle gösterilmez.
+-- =========================================================
+
+CREATE TABLE IF NOT EXISTS stream_sources (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    source_type TEXT NOT NULL DEFAULT 'hls',
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'inactive', 'blocked')),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_stream_sources_status
+ON stream_sources(status);
+
+-- =========================================================
+-- CANLI YAYINLAR
+-- audience:
+--   all      = yayının başlatıldığı andaki tüm aktif üyeler
+--   selected = yalnızca seçilmiş üyeler
+-- =========================================================
+
+CREATE TABLE IF NOT EXISTS broadcasts (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    message TEXT DEFAULT '',
+    stream_source_id TEXT NOT NULL,
+    audience TEXT NOT NULL
+        CHECK (audience IN ('all', 'selected')),
+    status TEXT NOT NULL DEFAULT 'draft'
+        CHECK (status IN ('draft', 'live', 'stopped')),
+    created_by TEXT,
+    started_at TEXT,
+    stopped_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (stream_source_id)
+        REFERENCES stream_sources(id)
+        ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_broadcasts_status
+ON broadcasts(status);
+
+CREATE INDEX IF NOT EXISTS idx_broadcasts_created
+ON broadcasts(created_at);
+
+CREATE INDEX IF NOT EXISTS idx_broadcasts_source
+ON broadcasts(stream_source_id);
+
+-- =========================================================
+-- YAYIN ALICILARI
+-- Yayın başlatılırken hedef üyeler burada sabitlenir.
+-- Böylece sonradan eklenen üyeler eski yayına otomatik katılmaz.
+-- =========================================================
+
+CREATE TABLE IF NOT EXISTS broadcast_recipients (
+    id TEXT PRIMARY KEY,
+    broadcast_id TEXT NOT NULL,
+    member_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'targeted'
+        CHECK (
+            status IN (
+                'targeted',
+                'authorized',
+                'denied',
+                'ended'
+            )
+        ),
+    authorized_at TEXT,
+    ended_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (broadcast_id)
+        REFERENCES broadcasts(id)
+        ON DELETE CASCADE,
+
+    FOREIGN KEY (member_id)
+        REFERENCES members(id)
+        ON DELETE CASCADE,
+
+    UNIQUE (broadcast_id, member_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_broadcast_recipients_member
+ON broadcast_recipients(member_id);
+
+CREATE INDEX IF NOT EXISTS idx_broadcast_recipients_broadcast
+ON broadcast_recipients(broadcast_id);
+
+CREATE INDEX IF NOT EXISTS idx_broadcast_recipients_status
+ON broadcast_recipients(status);
+
+-- =========================================================
+-- GÜVENLİ YAYIN OTURUMLARI
+-- Gerçek kaynak URL'si istemciye verilmez.
+-- ticket_hash yalnızca sunucu tarafında tutulur.
+-- =========================================================
+
+CREATE TABLE IF NOT EXISTS playback_sessions (
+    id TEXT PRIMARY KEY,
+    member_id TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    stream_source_id TEXT NOT NULL,
+    broadcast_id TEXT,
+    ticket_hash TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'revoked', 'expired')),
+    expires_at INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_seen TEXT,
+
+    FOREIGN KEY (member_id)
+        REFERENCES members(id)
+        ON DELETE CASCADE,
+
+    FOREIGN KEY (stream_source_id)
+        REFERENCES stream_sources(id)
+        ON DELETE RESTRICT,
+
+    FOREIGN KEY (broadcast_id)
+        REFERENCES broadcasts(id)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_playback_member
+ON playback_sessions(member_id);
+
+CREATE INDEX IF NOT EXISTS idx_playback_device
+ON playback_sessions(device_id);
+
+CREATE INDEX IF NOT EXISTS idx_playback_status
+ON playback_sessions(status);
+
+CREATE INDEX IF NOT EXISTS idx_playback_expiry
+ON playback_sessions(expires_at);
+
+CREATE INDEX IF NOT EXISTS idx_playback_broadcast
+ON playback_sessions(broadcast_id);
+
+-- =========================================================
+-- HLS ALT KAYNAK TOKENLARI
+-- Segment, anahtar, harita ve alt oynatma listeleri için.
+-- =========================================================
+
+-- HLS kaynak tokenları D1'e yazılmaz.
+-- Şifreli ve süreli tokenlar Worker tarafından doğrulanır.
+
+
+-- =========================================================
+-- YÖNETİM VE GÜVENLİK KAYITLARI
+-- =========================================================
+
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id TEXT PRIMARY KEY,
+    actor_type TEXT NOT NULL,
+    actor_id TEXT,
+    action TEXT NOT NULL,
+    target_type TEXT,
+    target_id TEXT,
+    details TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_actor
+ON audit_logs(actor_type, actor_id);
+
+CREATE INDEX IF NOT EXISTS idx_audit_action
+ON audit_logs(action);
+
+CREATE INDEX IF NOT EXISTS idx_audit_created
+ON audit_logs(created_at);
+
+-- =========================================================
+-- ÜYE MESAJLARI
+-- Mevcut messages tablosu korunur.
+-- member_id NULL: tüm üyelere gönderilen mesaj.
+-- Belirli member_id: yalnızca o üyeye gönderilen mesaj.
+-- =========================================================
+
+CREATE INDEX IF NOT EXISTS idx_messages_member_expiry
+ON messages(member_id, expires_at);
+
+-- =========================================================
+-- CİHAZ VE ÜYELİK SORGULARI
+-- Mevcut cihaz ve üye kayıtları korunur.
+-- =========================================================
+
+CREATE INDEX IF NOT EXISTS idx_devices_member_device_status
+ON devices(member_id, device_id, status);
+
+CREATE INDEX IF NOT EXISTS idx_members_status_expiry
+ON members(status, expires_at);
+
+
+
+
+===========================================================================
+DOSYA: package.json
+===========================================================================
+
+{
+  "name": "stream-access-service",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "node --check src/index.js",
+    "dev": "wrangler dev"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
+
+
+
+===========================================================================
+DOSYA: src/index.js
+===========================================================================
+
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+
+const VERSION = "2.0.0";
+const MEMBER_TOKEN_SECONDS = 10 * 365 * 24 * 60 * 60;
+const ADMIN_TOKEN_SECONDS = 8 * 60 * 60;
+const PLAYBACK_TOKEN_SECONDS = 120;
+const PLAYBACK_SESSION_SECONDS = 12 * 60 * 60;
+const PLAYBACK_TICKET_SECONDS = PLAYBACK_SESSION_SECONDS;
+const MAX_SELECTED_MEMBERS = 250;
+const MAX_GITHUB_FILE_BYTES = 900000;
+const MAX_GITHUB_CHUNK_BYTES = 24 * 1024 * 1024;
+const MAX_GITHUB_REQUEST_BYTES = 36 * 1024 * 1024;
+
+function json(data, status = 200, headers = {}) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
+      ...headers
+    }
+  });
+}
+
+function randomToken(bytes = 32) {
+  const value = crypto.getRandomValues(new Uint8Array(bytes));
+  return b64url(value);
+}
+
+function b64url(value) {
+  let binary = "";
+  for (const byte of value) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function unb64url(value) {
+  const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = normalized + "=".repeat((4 - normalized.length % 4) % 4);
+  const binary = atob(padded);
+  return Uint8Array.from(binary, c => c.charCodeAt(0));
+}
+
+async function sha256(value) {
+  const result = await crypto.subtle.digest(
+    "SHA-256",
+    typeof value === "string" ? encoder.encode(value) : value
+  );
+  return b64url(new Uint8Array(result));
+}
+
+function equalText(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const aa = encoder.encode(a);
+  const bb = encoder.encode(b);
+  if (aa.length !== bb.length) return false;
+  let diff = 0;
+  for (let i = 0; i < aa.length; i++) diff |= aa[i] ^ bb[i];
+  return diff === 0;
+}
+
+function bearer(request) {
+  const value = request.headers.get("Authorization") || "";
+  return value.startsWith("Bearer ") ? value.slice(7) : "";
+}
+
+async function readJson(request) {
+  try {
+    const length = Number(request.headers.get("Content-Length") || 0);
+    if (length > MAX_GITHUB_REQUEST_BYTES) return null;
+
+    const raw = await request.text();
+    if (encoder.encode(raw).length > MAX_GITHUB_REQUEST_BYTES) return null;
+
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function uuid() {
+  return crypto.randomUUID();
+}
+
+function nowSeconds() {
+  return Math.floor(Date.now() / 1000);
+}
+
+function normalizeExpiry(value) {
+  if (!value) return null;
+  const time = Date.parse(value);
+  return Number.isFinite(time) ? time : null;
+}
+
+async function signingKey(env) {
+  if (!env.TOKEN_SIGNING_SECRET || env.TOKEN_SIGNING_SECRET.length < 32) {
+    throw new Error("TOKEN_SIGNING_SECRET must contain at least 32 characters");
+  }
+
+  return crypto.subtle.importKey(
+    "raw",
+    encoder.encode(env.TOKEN_SIGNING_SECRET),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign", "verify"]
+  );
+}
+
+async function createJwt(payload, env, lifetime) {
+  const header = b64url(encoder.encode(JSON.stringify({
+    alg: "HS256",
+    typ: "JWT"
+  })));
+
+  const body = b64url(encoder.encode(JSON.stringify({
+    ...payload,
+    iat: nowSeconds(),
+    exp: nowSeconds() + lifetime
+  })));
+
+  const input = `${header}.${body}`;
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    await signingKey(env),
+    encoder.encode(input)
+  );
+
+  return `${input}.${b64url(new Uint8Array(signature))}`;
+}
+
+async function verifyJwt(token, env) {
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 3) return null;
+
+    const input = `${parts[0]}.${parts[1]}`;
+    const signature = unb64url(parts[2]);
+
+    const valid = await crypto.subtle.verify(
+      "HMAC",
+      await signingKey(env),
+      signature,
+      encoder.encode(input)
+    );
+
+    if (!valid) return null;
+
+    const payload = JSON.parse(decoder.decode(unb64url(parts[1])));
+    if (!payload.exp || payload.exp <= nowSeconds()) return null;
+
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+async function hashPassword(password) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(password),
+    "PBKDF2",
+    false,
+    ["deriveBits"]
+  );
+
+  const result = await crypto.subtle.deriveBits({
+    name: "PBKDF2",
+    salt,
+    iterations: 100000,
+    hash: "SHA-256"
+  }, key, 256);
+
+  return `pbkdf2$100000$${b64url(salt)}$${b64url(new Uint8Array(result))}`;
+}
+
+async function checkPassword(password, stored) {
+  try {
+    const parts = stored.split("$");
+    if (parts.length !== 4 || parts[0] !== "pbkdf2") return false;
+
+    const iterations = Number(parts[1]);
+    if (!Number.isInteger(iterations) ||
+        iterations < 100000 ||
+        iterations > 100000) return false;
+
+    const salt = unb64url(parts[2]);
+    const expected = unb64url(parts[3]);
+
+    const key = await crypto.subtle.importKey(
+      "raw",
+      encoder.encode(password),
+      "PBKDF2",
+      false,
+      ["deriveBits"]
+    );
+
+    const actual = new Uint8Array(await crypto.subtle.deriveBits({
+      name: "PBKDF2",
+      salt,
+      iterations,
+      hash: "SHA-256"
+    }, key, 256));
+
+    if (actual.length !== expected.length) return false;
+
+    let diff = 0;
+    for (let i = 0; i < actual.length; i++) {
+      diff |= actual[i] ^ expected[i];
+    }
+
+    return diff === 0;
+  } catch {
+    return false;
+  }
+}
+
+async function adminAuth(request, env) {
+  const token = bearer(request);
+  if (!token) return null;
+
+  if (env.ADMIN_API_KEY && equalText(token, env.ADMIN_API_KEY)) {
+    return { role: "admin", id: "api-key" };
+  }
+
+  const payload = await verifyJwt(token, env);
+  return payload?.role === "admin" ? payload : null;
+}
+
+async function memberAuth(request, env) {
+  const token = bearer(request);
+  if (!token) return null;
+
+  const payload = await verifyJwt(token, env);
+  if (!payload || payload.role !== "member") return null;
+
+  const member = await env.DB.prepare(`
+    SELECT id, member_code, display_name, status, max_devices, expires_at
+    FROM members
+    WHERE id = ?
+    LIMIT 1
+  `).bind(payload.member_id).first();
+
+  if (!member || member.status !== "active") return null;
+
+  const expiry = normalizeExpiry(member.expires_at);
+  if (expiry && expiry <= Date.now()) return null;
+
+  const device = await env.DB.prepare(`
+    SELECT id, status, token_hash
+    FROM devices
+    WHERE member_id = ? AND device_id = ?
+    LIMIT 1
+  `).bind(member.id, payload.device_id).first();
+
+  if (!device || device.status !== "active") return null;
+
+  const tokenHash = await sha256(token);
+  if (!equalText(device.token_hash || "", tokenHash)) return null;
+
+  return {
+    member,
+    deviceId: payload.device_id,
+    deviceRecordId: device.id
+  };
+}
+
+function allowedSource(raw, env) {
+  try {
+    const url = new URL(raw);
+
+    if (!["http:", "https:"].includes(url.protocol)) return false;
+    if (url.username || url.password) return false;
+
+    const host = url.hostname.toLowerCase();
+
+    if (!host || host === "localhost" ||
+        host.endsWith(".localhost") ||
+        host.endsWith(".local") ||
+        host.endsWith(".internal")) return false;
+
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) {
+      const parts = host.split(".").map(Number);
+      if (parts.some(x => x < 0 || x > 255)) return false;
+
+      const [a, b, c, d] = parts;
+
+      if (
+        a === 0 || a === 10 || a === 127 ||
+        a >= 224 ||
+        (a === 100 && b >= 64 && b <= 127) ||
+        (a === 169 && b === 254) ||
+        (a === 172 && b >= 16 && b <= 31) ||
+        (a === 192 && b === 168) ||
+        (a === 192 && b === 0 && c === 0) ||
+        (a === 192 && b === 0 && c === 2) ||
+        (a === 198 && (b === 18 || b === 19)) ||
+        (a === 198 && b === 51 && c === 100) ||
+        (a === 203 && b === 0 && c === 113) ||
+        (a === 255 && b === 255 && c === 255 && d === 255)
+      ) return false;
+
+      return true;
+    }
+
+    // IPv6 adresleri şimdilik kabul edilmez.
+    if (host.includes(":")) return false;
+
+    // Özel alan adları ve yerel ağ adları kabul edilmez.
+    if (
+      host === "localhost" ||
+      host.endsWith(".localhost") ||
+      host.endsWith(".local") ||
+      host.endsWith(".internal")
+    ) return false;
+
+    // Önceden tanımlı izin listesi olmadan genel DNS alan adlarını kabul et.
+    // URL uzantısı ve query parametreleri burada filtrelenmez.
+    if (host.length > 253) return false;
+
+    const labels = host.split(".");
+    if (labels.length < 2) return false;
+
+    return labels.every(label =>
+      label.length >= 1 &&
+      label.length <= 63 &&
+      /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/i.test(label)
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function audit(env, action, targetId = null, details = null, actor = "admin") {
+  try {
+    await env.DB.prepare(`
+      INSERT INTO audit_logs
+        (id, actor_type, actor_id, action, target_type, target_id, details)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      uuid(),
+      actor,
+      actor === "admin" ? "admin" : actor,
+      action,
+      null,
+      targetId,
+      details ? JSON.stringify(details) : null
+    ).run();
+  } catch {
+    // Audit failure must not expose secrets or break media delivery.
+  }
+}
+
+/* =========================================================
+   ENCRYPTED STATELESS MEDIA TOKENS
+
+   HLS resources are encrypted in the token itself.
+   No D1 query or write occurs for individual video segments.
+   ========================================================= */
+
+async function mediaKey(env) {
+  if (!env.TOKEN_SIGNING_SECRET || env.TOKEN_SIGNING_SECRET.length < 32) {
+    throw new Error("TOKEN_SIGNING_SECRET missing");
+  }
+
+  const raw = await crypto.subtle.digest(
+    "SHA-256",
+    encoder.encode(env.TOKEN_SIGNING_SECRET + "|media-token-v1")
+  );
+
+  return crypto.subtle.importKey(
+    "raw",
+    raw,
+    { name: "AES-GCM" },
+    false,
+    ["encrypt", "decrypt"]
+  );
+}
+
+async function createMediaToken(payload, env, lifetime) {
+  const data = encoder.encode(JSON.stringify({
+    ...payload,
+    exp: nowSeconds() + lifetime,
+    ver: 1
+  }));
+
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+
+  const encrypted = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    await mediaKey(env),
+    data
+  );
+
+  return `${b64url(iv)}.${b64url(new Uint8Array(encrypted))}`;
+}
+
+async function readMediaToken(token, env) {
+  try {
+    const parts = token.split(".");
+    if (parts.length !== 2) return null;
+
+    const decrypted = await crypto.subtle.decrypt(
+      { name: "AES-GCM", iv: unb64url(parts[0]) },
+      await mediaKey(env),
+      unb64url(parts[1])
+    );
+
+    const payload = JSON.parse(decoder.decode(decrypted));
+
+    if (payload.ver !== 1 ||
+        !payload.exp ||
+        payload.exp <= nowSeconds()) return null;
+
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+async function makeResourceUrl(sourceUrl, env, session) {
+  if (!allowedSource(sourceUrl, env)) {
+    throw new Error("Source host is not allowed");
+  }
+
+  // Playlist kaynakları oturum kontrolünden geçer.
+  // Segment ve medya kaynakları stateless kalır.
+  const kind = isManifest(sourceUrl, "")
+    ? "manifest"
+    : "resource";
+
+  const token = await createMediaToken({
+    kind,
+    url: sourceUrl,
+    sid: session.sid,
+    member_id: session.member_id,
+    device_id: session.device_id,
+    broadcast_id: session.broadcast_id || null
+  }, env, PLAYBACK_TOKEN_SECONDS);
+
+  return `/p/${token}`;
+}
+
+function isManifest(url, contentType) {
+  return /\.(m3u8?|mpd)(?:$|\?)/i.test(url) ||
+    /mpegurl|vnd\.apple\.mpegurl|dash\+xml/i.test(contentType || "");
+}
+
+function isDashManifest(url, contentType) {
+  return /\.mpd(?:$|\?)/i.test(url) ||
+    /dash\+xml/i.test(contentType || "");
+}
+
+async function rewriteManifest(text, baseUrl, env, session) {
+  if (isDashManifest(baseUrl, "")) {
+    return rewriteDashManifest(text, baseUrl, env, session);
+  }
+
+  const lines = text.split(/\r?\n/);
+  const output = [];
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+
+    if (!trimmed) {
+      output.push(line);
+      continue;
+    }
+
+    if (trimmed.startsWith("#")) {
+      const rewritten = await rewriteUriAttributes(
+        line, baseUrl, env, session
+      );
+      output.push(rewritten);
+      continue;
+    }
+
+    const absolute = new URL(trimmed, baseUrl).toString();
+    output.push(await makeResourceUrl(absolute, env, session));
+  }
+
+  return output.join("\n");
+}
+
+
+async function rewriteDashManifest(text, baseUrl, env, session) {
+  if (!/<MPD[\s>]/i.test(text)) {
+    throw new Error("Invalid DASH manifest");
+  }
+
+  const urlAttributes = /\b(media|initialization|sourceURL|href)="([^"]+)"/gi;
+  let output = text;
+  const replacements = [];
+
+  for (const match of text.matchAll(urlAttributes)) {
+    const original = match[2];
+
+    if (!original || original.startsWith("data:")) continue;
+
+    const absolute = new URL(original, baseUrl).toString();
+    const proxy = await makeResourceUrl(absolute, env, session);
+
+    replacements.push({
+      original: match[0],
+      replacement: `${match[1]}="${proxy}"`
+    });
+  }
+
+  for (const item of replacements) {
+    output = output.replace(item.original, item.replacement);
+  }
+
+  const baseRegex = /(<BaseURL[^>]*>)([^<]+)(<\/BaseURL>)/gi;
+  const baseMatches = [...output.matchAll(baseRegex)];
+
+  for (const match of baseMatches) {
+    const original = match[2].trim();
+    if (!original || original.startsWith("data:")) continue;
+
+    const absolute = new URL(original, baseUrl).toString();
+    const proxy = await makeResourceUrl(absolute, env, session);
+
+    output = output.replace(
+      match[0],
+      `${match[1]}${proxy}${match[3]}`
+    );
+  }
+
+  return output;
+}
+
+async function rewriteUriAttributes(line, baseUrl, env, session) {
+  const regex = /URI="([^"]+)"/g;
+  let result = line;
+  const matches = [...line.matchAll(regex)];
+
+  for (const match of matches) {
+    const original = match[1];
+    const absolute = new URL(original, baseUrl).toString();
+    const replacement = await makeResourceUrl(absolute, env, session);
+    result = result.replace(
+      `URI="${original}"`,
+      `URI="${replacement}"`
+    );
+  }
+
+  return result;
+}
+
+function mediaResponseHeaders(upstream, manifest = false, cors = {}) {
+  const headers = new Headers(cors);
+
+  const type = upstream.headers.get("Content-Type");
+  if (type) headers.set("Content-Type", type);
+
+  for (const name of [
+    "Content-Range",
+    "Accept-Ranges",
+    "Content-Length"
+  ]) {
+    const value = upstream.headers.get(name);
+    if (value && !manifest) headers.set(name, value);
+  }
+
+  headers.set("Cache-Control", "private, no-store");
+  headers.set("X-Content-Type-Options", "nosniff");
+
+  return headers;
+}
+
+
+async function playbackGuardRequest(env, sid, path, body = {}) {
+  if (!env.PLAYBACK_GUARD || !env.PLAYBACK_GUARD_SECRET) {
+    throw new Error("Playback guard is not configured");
+  }
+
+  const id = env.PLAYBACK_GUARD.idFromName(String(sid));
+  const stub = env.PLAYBACK_GUARD.get(id);
+
+  const response = await stub.fetch("https://guard.internal" + path, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Guard-Secret": env.PLAYBACK_GUARD_SECRET
+    },
+    body: JSON.stringify({ ...body, sid: String(sid) })
+  });
+
+  const result = await response.json().catch(() => null);
+
+  if (!response.ok || !result?.ok) {
+    throw new Error("Playback guard rejected request");
+  }
+
+  return result;
+}
+
+async function activePlaybackSession(env, payload) {
+  if (!payload?.sid || !payload?.member_id || !payload?.device_id) {
+    return false;
+  }
+
+  try {
+    const result = await playbackGuardRequest(
+      env,
+      payload.sid,
+      "/internal/check",
+      {
+        member_id: payload.member_id,
+        device_id: payload.device_id,
+        broadcast_id: payload.broadcast_id || null
+      }
+    );
+
+    return result.active === true;
+  } catch {
+    return false;
+  }
+}
+
+
+async function revokePlaybackSessionIds(env, rows) {
+  const ids = [...new Set(
+    (rows || []).map(row => String(row.id || "")).filter(Boolean)
+  )];
+
+  try {
+    const results = await Promise.all(
+      ids.map(id => playbackGuardRequest(env, id, "/internal/revoke"))
+    );
+
+    return results.length === ids.length;
+  } catch {
+    return false;
+  }
+}
+
+async function proxyMedia(request, env, token, cors = {}) {
+  const respondJson = (data, status) => json(data, status, cors);
+  const payload = await readMediaToken(token, env);
+
+  if (!payload ||
+      !["play", "manifest", "resource"].includes(payload.kind) ||
+      !payload.url ||
+      !payload.sid ||
+      !allowedSource(payload.url, env)) {
+    return respondJson({ ok: false, error: "Invalid or expired playback token" }, 403);
+  }
+
+  // Bütün medya istekleri Durable Object üzerinden doğrulanır.
+  // Bu yolun hiçbir aşamasında D1 sorgusu yapılmaz.
+  let active = false;
+
+  try {
+    active = await activePlaybackSession(env, payload);
+  } catch {
+    return respondJson({
+      ok: false,
+      error: "Playback authorization unavailable"
+    }, 503);
+  }
+
+  if (!active) {
+    return respondJson({
+      ok: false,
+      error: "Playback session revoked or expired"
+    }, 403);
+  }
+
+  const headers = new Headers({
+    "Accept": request.headers.get("Accept") || "*/*",
+    "User-Agent": "MediaProxy/2.0"
+  });
+
+  try {
+    const sourceHost = new URL(payload.url).hostname.toLowerCase();
+    if (sourceHost === "andro.evrenesoglu101.click") {
+      headers.set("Referer", "https://taraftarium24.xyz/");
+      headers.set("Origin", "https://taraftarium24.xyz");
+    }
+  } catch (_) {}
+
+
+  const range = request.headers.get("Range");
+  if (range) headers.set("Range", range);
+
+  let upstream;
+  let currentUrl = payload.url;
+
+  // Yönlendirmeleri kontrollü takip et.
+  // Her yeni adres yeniden doğrulanır.
+  for (let redirectCount = 0; redirectCount <= 5; redirectCount++) {
+    if (!allowedSource(currentUrl, env)) {
+      return respondJson({
+        ok: false,
+        error: "Redirect source is not permitted"
+      }, 502);
+    }
+
+    try {
+      upstream = await fetch(currentUrl, {
+        method: "GET",
+        headers,
+        redirect: "manual"
+      });
+    } catch {
+      return respondJson({
+        ok: false,
+        error: "Upstream unavailable"
+      }, 502);
+    }
+
+    if (upstream.status < 300 || upstream.status >= 400) {
+      break;
+    }
+
+    const location = upstream.headers.get("Location");
+
+    if (!location || redirectCount === 5) {
+      return respondJson({
+        ok: false,
+        error: "Redirect limit exceeded"
+      }, 502);
+    }
+
+    try {
+      currentUrl = new URL(location, currentUrl).toString();
+    } catch {
+      return respondJson({
+        ok: false,
+        error: "Invalid redirect address"
+      }, 502);
+    }
+  }
+
+  if (!upstream || (upstream.status >= 300 && upstream.status < 400)) {
+    return respondJson({
+      ok: false,
+      error: "Upstream redirect failed"
+    }, 502);
+  }
+
+  if (!upstream.ok && upstream.status !== 206) {
+    return respondJson({ ok: false, error: "Upstream request failed" }, 502);
+  }
+
+  const contentType = upstream.headers.get("Content-Type") || "";
+  const manifest = isManifest(currentUrl, contentType);
+
+  if (manifest) {
+    const sourceText = await upstream.text();
+
+    if (sourceText.length > 2 * 1024 * 1024) {
+      return respondJson({ ok: false, error: "Manifest too large" }, 502);
+    }
+
+    let rewritten;
+
+    try {
+      rewritten = await rewriteManifest(
+        sourceText,
+        currentUrl,
+        env,
+        {
+          sid: payload.sid,
+          member_id: payload.member_id,
+          device_id: payload.device_id,
+          broadcast_id: payload.broadcast_id || null
+        }
+      );
+    } catch {
+      return respondJson({ ok: false, error: "Manifest rewrite failed" }, 502);
+    }
+
+    return new Response(rewritten, {
+      status: 200,
+      headers: mediaResponseHeaders(upstream, true, cors)
+    });
+  }
+
+  return new Response(upstream.body, {
+    status: upstream.status,
+    headers: mediaResponseHeaders(upstream, false, cors)
+  });
+}
+
+async function issuePlayback(env, member, deviceId, source, broadcastId = null) {
+  if (!source || source.status !== "active") {
+    return { error: "Stream unavailable" };
+  }
+
+  if (!allowedSource(source.source_url, env)) {
+    return { error: "Stream source is not permitted" };
+  }
+
+  const sid = uuid();
+  const ticket = await createMediaToken({
+    kind: "play",
+    url: source.source_url,
+    sid,
+    member_id: member.id,
+    device_id: deviceId,
+    broadcast_id: broadcastId
+  }, env, PLAYBACK_TICKET_SECONDS);
+
+  const ticketHash = await sha256(ticket);
+
+  // Oynatma bileti ve oturum aynı 12 saatlik süreyi kullanır.
+  const expiry = nowSeconds() + PLAYBACK_SESSION_SECONDS;
+
+  await env.DB.prepare(`
+    INSERT INTO playback_sessions
+      (id, member_id, device_id, stream_source_id, broadcast_id,
+       ticket_hash, status, expires_at)
+    VALUES (?, ?, ?, ?, ?, ?, 'active', ?)
+  `).bind(
+    sid,
+    member.id,
+    deviceId,
+    source.id,
+    broadcastId,
+    ticketHash,
+    expiry
+  ).run();
+
+  try {
+    await playbackGuardRequest(
+      env,
+      sid,
+      "/internal/session",
+      {
+        member_id: member.id,
+        device_id: deviceId,
+        broadcast_id: broadcastId,
+        exp: expiry
+      }
+    );
+  } catch (error) {
+    await env.DB.prepare(`
+      UPDATE playback_sessions
+      SET status = 'revoked'
+      WHERE id = ? AND status = 'active'
+    `).bind(sid).run();
+
+    return { error: "Playback security initialization failed" };
+  }
+
+  return {
+    playback_url: `/play/${ticket}`,
+    expires_in: PLAYBACK_TICKET_SECONDS
+  };
+}
+
+/* =========================================================
+   LOGIN
+   ========================================================= */
+
+async function handleLogin(request, env, path) {
+  const body = await readJson(request);
+  if (!body) return json({ ok: false, error: "Invalid JSON" }, 400);
+
+  if (path === "/auth/admin/login") {
+    const password = String(body.password || "");
+
+    if (!env.ADMIN_LOGIN_PASSWORD ||
+        !equalText(password, env.ADMIN_LOGIN_PASSWORD)) {
+      return json({ ok: false, error: "Invalid credentials" }, 401);
+    }
+
+    const token = await createJwt({
+      role: "admin",
+      id: "admin"
+    }, env, ADMIN_TOKEN_SECONDS);
+
+    return json({
+      ok: true,
+      token,
+      expires_in: ADMIN_TOKEN_SECONDS
+    });
+  }
+
+  if (path === "/auth/member/login") {
+    const code = String(body.member_code || "").trim();
+    const password = String(body.password || "");
+    const deviceId = String(body.device_id || "").trim();
+    const deviceName = String(body.device_name || "Android").slice(0, 120);
+
+    if (!code || !password || !deviceId || deviceId.length > 180) {
+      return json({ ok: false, error: "Missing login fields" }, 400);
+    }
+
+    const member = await env.DB.prepare(`
+      SELECT *
+      FROM members
+      WHERE member_code = ?
+      LIMIT 1
+    `).bind(code).first();
+
+    if (!member ||
+        member.status !== "active" ||
+        !member.password_hash) {
+      return json({ ok: false, error: "Invalid credentials" }, 401);
+    }
+
+    const expiry = normalizeExpiry(member.expires_at);
+    if (expiry && expiry <= Date.now()) {
+      return json({ ok: false, error: "Membership expired" }, 403);
+    }
+
+    if (!await checkPassword(password, member.password_hash)) {
+      return json({ ok: false, error: "Invalid credentials" }, 401);
+    }
+
+    const existing = await env.DB.prepare(`
+      SELECT id, status
+      FROM devices
+      WHERE member_id = ? AND device_id = ?
+      LIMIT 1
+    `).bind(member.id, deviceId).first();
+
+    if (existing?.status === "blocked") {
+      return json({ ok: false, error: "Device blocked" }, 403);
+    }
+
+    const count = await env.DB.prepare(`
+      SELECT COUNT(*) AS total
+      FROM devices
+      WHERE member_id = ? AND status = 'active'
+    `).bind(member.id).first();
+
+    if (!existing && Number(count?.total || 0) >= Number(member.max_devices || 1)) {
+      return json({ ok: false, error: "Device limit reached" }, 403);
+    }
+
+    const token = await createJwt({
+      role: "member",
+      member_id: member.id,
+      device_id: deviceId
+    }, env, MEMBER_TOKEN_SECONDS);
+
+    const tokenHash = await sha256(token);
+    const deviceRecordId = existing?.id || uuid();
+
+    if (existing) {
+      await env.DB.prepare(`
+        UPDATE devices
+        SET device_name = ?, token_hash = ?, status = 'active',
+            last_seen = CURRENT_TIMESTAMP
+        WHERE id = ?
+      `).bind(deviceName, tokenHash, deviceRecordId).run();
+    } else {
+      await env.DB.prepare(`
+        INSERT INTO devices
+          (id, member_id, device_id, device_name, token_hash,
+           status, paired_at, last_seen)
+        VALUES (?, ?, ?, ?, ?, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      `).bind(
+        deviceRecordId,
+        member.id,
+        deviceId,
+        deviceName,
+        tokenHash
+      ).run();
+    }
+
+    return json({
+      ok: true,
+      token,
+      expires_in: MEMBER_TOKEN_SECONDS,
+      member: {
+        id: member.id,
+        member_code: member.member_code,
+        display_name: member.display_name,
+        expires_at: member.expires_at,
+        max_devices: member.max_devices
+      }
+    });
+  }
+
+  return json({ ok: false, error: "Not found" }, 404);
+}
+
+/* =========================================================
+   ADMIN API
+   ========================================================= */
+
+async function handleAdmin(request, env, path, method) {
+  if (method === "GET" && path === "/admin/members") {
+    const result = await env.DB.prepare(`
+      SELECT id, member_code, display_name, status,
+             max_devices, expires_at, created_at
+      FROM members
+      ORDER BY created_at DESC
+      LIMIT 1000
+    `).all();
+
+    return json({ ok: true, members: result.results || [] });
+  }
+
+  if (method === "POST" && path === "/admin/members") {
+    const body = await readJson(request);
+    if (!body) return json({ ok: false, error: "Invalid JSON" }, 400);
+
+    const name = String(body.display_name || "").trim();
+    const password = String(body.password || "");
+    const maxDevices = Math.min(20, Math.max(1, Number(body.max_devices || 1)));
+
+    if (!name || name.length > 120 || password.length < 6 || password.length > 256) {
+      return json({ ok: false, error: "Invalid member data" }, 400);
+    }
+
+    if (body.expires_at && !normalizeExpiry(body.expires_at)) {
+      return json({ ok: false, error: "Invalid expiration date" }, 400);
+    }
+
+    const id = uuid();
+    const code = `MBR-${randomToken(9).toUpperCase()}`;
+    const passwordHash = await hashPassword(password);
+
+    await env.DB.prepare(`
+      INSERT INTO members
+        (id, member_code, display_name, status,
+         max_devices, expires_at, password_hash)
+      VALUES (?, ?, ?, 'active', ?, ?, ?)
+    `).bind(
+      id,
+      code,
+      name,
+      maxDevices,
+      body.expires_at || null,
+      passwordHash
+    ).run();
+
+    await audit(env, "member_created", id);
+
+    return json({
+      ok: true,
+      member: {
+        id,
+        member_code: code,
+        display_name: name,
+        status: "active"
+      }
+    }, 201);
+  }
+
+
+  // MEMBER_DELETE_ROUTE_V1
+  const memberDelete = path.match(/^\/admin\/members\/([^/]+)\/delete$/);
+
+  if (method === "POST" && memberDelete) {
+    const id = memberDelete[1];
+
+    const member = await env.DB.prepare(
+      "SELECT id FROM members WHERE id = ? LIMIT 1"
+    ).bind(id).first();
+
+    if (!member) {
+      return json({ ok: false, error: "Member not found" }, 404);
+    }
+
+    const sessions = await env.DB.prepare(`
+      SELECT id FROM playback_sessions
+      WHERE member_id = ? AND status = 'active'
+    `).bind(id).all();
+
+    if (!await revokePlaybackSessionIds(env, sessions.results || [])) {
+      return json({ ok: false, error: "Playback revocation unavailable" }, 503);
+    }
+
+    await audit(env, "member_deleted", id);
+
+    await env.DB.batch([
+      env.DB.prepare(
+        "DELETE FROM playback_sessions WHERE member_id = ?"
+      ).bind(id),
+      env.DB.prepare(
+        "DELETE FROM broadcast_recipients WHERE member_id = ?"
+      ).bind(id),
+      env.DB.prepare(
+        "DELETE FROM messages WHERE member_id = ?"
+      ).bind(id),
+      env.DB.prepare(
+        "DELETE FROM devices WHERE member_id = ?"
+      ).bind(id),
+      env.DB.prepare(
+        "DELETE FROM members WHERE id = ?"
+      ).bind(id)
+    ]);
+
+    return json({ ok: true, deleted: true });
+  }
+
+  const memberStatus = path.match(/^\/admin\/members\/([^/]+)\/status$/);
+
+  if (method === "PATCH" && memberStatus) {
+    const body = await readJson(request);
+    const status = body?.status;
+
+    if (!["active", "inactive", "blocked"].includes(status)) {
+      return json({ ok: false, error: "Invalid status" }, 400);
+    }
+
+    if (status !== "active") {
+      const sessions = await env.DB.prepare(`
+        SELECT id FROM playback_sessions
+        WHERE member_id = ? AND status = 'active'
+      `).bind(memberStatus[1]).all();
+
+      if (!await revokePlaybackSessionIds(env, sessions.results || [])) {
+        return json({ ok: false, error: "Playback revocation unavailable" }, 503);
+      }
+    }
+
+    await env.DB.prepare(`
+      UPDATE members SET status = ? WHERE id = ?
+    `).bind(status, memberStatus[1]).run();
+
+    if (status !== "active") {
+      await env.DB.prepare(`
+        UPDATE playback_sessions
+        SET status = 'revoked'
+        WHERE member_id = ? AND status = 'active'
+      `).bind(memberStatus[1]).run();
+    }
+
+    await audit(env, "member_status_changed", memberStatus[1], { status });
+    return json({ ok: true });
+  }
+
+  if (method === "GET" && path === "/admin/devices") {
+    const result = await env.DB.prepare(`
+      SELECT d.id, d.member_id, d.device_id, d.device_name,
+             d.status, d.paired_at, d.last_seen,
+             m.member_code, m.display_name
+      FROM devices d
+      LEFT JOIN members m ON m.id = d.member_id
+      ORDER BY d.last_seen DESC
+      LIMIT 2000
+    `).all();
+
+    return json({ ok: true, devices: result.results || [] });
+  }
+
+  const deviceStatus = path.match(/^\/admin\/devices\/([^/]+)\/status$/);
+
+  if (method === "PATCH" && deviceStatus) {
+    const body = await readJson(request);
+    const status = body?.status;
+
+    if (!["active", "blocked"].includes(status)) {
+      return json({ ok: false, error: "Invalid status" }, 400);
+    }
+
+    if (status === "blocked") {
+      const sessions = await env.DB.prepare(`
+        SELECT ps.id
+        FROM playback_sessions ps
+        JOIN devices d
+          ON d.device_id = ps.device_id
+         AND d.member_id = ps.member_id
+        WHERE d.id = ?
+          AND ps.status = 'active'
+      `).bind(deviceStatus[1]).all();
+
+      if (!await revokePlaybackSessionIds(env, sessions.results || [])) {
+        return json({ ok: false, error: "Playback revocation unavailable" }, 503);
+      }
+    }
+
+    await env.DB.prepare(`
+      UPDATE devices SET status = ? WHERE id = ?
+    `).bind(status, deviceStatus[1]).run();
+
+    if (status === "blocked") {
+      await env.DB.prepare(`
+        UPDATE playback_sessions
+        SET status = 'revoked'
+        WHERE device_id = (
+          SELECT device_id FROM devices WHERE id = ?
+        )
+        AND member_id = (
+          SELECT member_id FROM devices WHERE id = ?
+        )
+        AND status = 'active'
+      `).bind(deviceStatus[1], deviceStatus[1]).run();
+    }
+
+    await audit(env, "device_status_changed", deviceStatus[1], { status });
+    return json({ ok: true });
+  }
+
+  const messageDelete = path.match(/^\/admin\/messages\/([^/]+)\/delete$/);
+  if (method === "POST" && messageDelete) {
+    const id = messageDelete[1];
+
+    const message = await env.DB.prepare(
+      "SELECT id FROM messages WHERE id = ? LIMIT 1"
+    ).bind(id).first();
+
+    if (!message) {
+      return json({ ok: false, error: "Message not found" }, 404);
+    }
+
+    await env.DB.prepare(
+      "DELETE FROM messages WHERE id = ?"
+    ).bind(id).run();
+
+    await audit(env, "message_deleted", id);
+    return json({ ok: true, deleted: true });
+  }
+
+  if (method === "GET" && path === "/admin/messages") {
+    const result = await env.DB.prepare(`
+      SELECT id, member_id, title, body, created_at, expires_at
+      FROM messages
+      ORDER BY created_at DESC
+      LIMIT 1000
+    `).all();
+
+    return json({ ok: true, messages: result.results || [] });
+  }
+
+  if (method === "POST" && path === "/admin/messages") {
+    const body = await readJson(request);
+    if (!body) return json({ ok: false, error: "Invalid JSON" }, 400);
+
+    const title = String(body.title || "").trim();
+    const message = String(body.body || "").trim();
+    const audience = body.audience || (body.member_id ? "selected" : "all");
+
+    if (!title || !message ||
+        title.length > 180 ||
+        message.length > 10000 ||
+        !["all", "selected"].includes(audience)) {
+      return json({ ok: false, error: "Invalid message" }, 400);
+    }
+
+    const expiry = body.expires_at || null;
+    if (expiry && !normalizeExpiry(expiry)) {
+      return json({ ok: false, error: "Invalid expiration date" }, 400);
+    }
+
+    if (audience === "all") {
+      await env.DB.prepare(`
+        INSERT INTO messages (id, member_id, title, body, expires_at)
+        VALUES (?, NULL, ?, ?, ?)
+      `).bind(uuid(), title, message, expiry).run();
+
+      await audit(env, "message_sent_all");
+      return json({ ok: true, audience: "all" }, 201);
+    }
+
+    const ids = Array.isArray(body.member_ids)
+      ? [...new Set(body.member_ids.map(String))]
+      : body.member_id ? [String(body.member_id)] : [];
+
+    if (!ids.length || ids.length > MAX_SELECTED_MEMBERS) {
+      return json({ ok: false, error: "Invalid member selection" }, 400);
+    }
+
+    const placeholders = ids.map(() => "?").join(",");
+    const members = await env.DB.prepare(`
+      SELECT id FROM members
+      WHERE status = 'active' AND id IN (${placeholders})
+    `).bind(...ids).all();
+
+    const validIds = (members.results || []).map(x => x.id);
+    if (!validIds.length) {
+      return json({ ok: false, error: "No active recipients" }, 400);
+    }
+
+    const statements = validIds.map(id =>
+      env.DB.prepare(`
+        INSERT INTO messages (id, member_id, title, body, expires_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).bind(uuid(), id, title, message, expiry)
+    );
+
+    await env.DB.batch(statements);
+    await audit(env, "message_sent_se

@@ -1,0 +1,1317 @@
+blocked" }, 403);
+    }
+
+    const count = await env.DB.prepare(`
+      SELECT COUNT(*) AS total
+      FROM devices
+      WHERE member_id = ? AND status = 'active'
+    `).bind(member.id).first();
+
+    if (!existing && Number(count?.total || 0) >= Number(member.max_devices || 1)) {
+      return json({ ok: false, error: "Device limit reached" }, 403);
+    }
+
+    const token = await createJwt({
+      role: "member",
+      member_id: member.id,
+      device_id: deviceId
+    }, env, MEMBER_TOKEN_SECONDS);
+
+    const tokenHash = await sha256(token);
+    const deviceRecordId = existing?.id || uuid();
+
+    if (existing) {
+      await env.DB.prepare(`
+        UPDATE devices
+        SET device_name = ?, token_hash = ?, status = 'active',
+            last_seen = CURRENT_TIMESTAMP
+        WHERE id = ?
+      `).bind(deviceName, tokenHash, deviceRecordId).run();
+    } else {
+      await env.DB.prepare(`
+        INSERT INTO devices
+          (id, member_id, device_id, device_name, token_hash,
+           status, paired_at, last_seen)
+        VALUES (?, ?, ?, ?, ?, 'active', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      `).bind(
+        deviceRecordId,
+        member.id,
+        deviceId,
+        deviceName,
+        tokenHash
+      ).run();
+    }
+
+    return json({
+      ok: true,
+      token,
+      expires_in: MEMBER_TOKEN_SECONDS,
+      member: {
+        id: member.id,
+        member_code: member.member_code,
+        display_name: member.display_name,
+        expires_at: member.expires_at,
+        max_devices: member.max_devices
+      }
+    });
+  }
+
+  return json({ ok: false, error: "Not found" }, 404);
+}
+
+/* =========================================================
+   ADMIN API
+   ========================================================= */
+
+async function handleAdmin(request, env, path, method) {
+  if (method === "GET" && path === "/admin/members") {
+    const result = await env.DB.prepare(`
+      SELECT id, member_code, display_name, status,
+             max_devices, expires_at, created_at
+      FROM members
+      ORDER BY created_at DESC
+      LIMIT 1000
+    `).all();
+
+    return json({ ok: true, members: result.results || [] });
+  }
+
+  if (method === "POST" && path === "/admin/members") {
+    const body = await readJson(request);
+    if (!body) return json({ ok: false, error: "Invalid JSON" }, 400);
+
+    const name = String(body.display_name || "").trim();
+    const password = String(body.password || "");
+    const maxDevices = Math.min(20, Math.max(1, Number(body.max_devices || 1)));
+
+    if (!name || name.length > 120 || password.length < 6 || password.length > 256) {
+      return json({ ok: false, error: "Invalid member data" }, 400);
+    }
+
+    if (body.expires_at && !normalizeExpiry(body.expires_at)) {
+      return json({ ok: false, error: "Invalid expiration date" }, 400);
+    }
+
+    const id = uuid();
+    const code = `MBR-${randomToken(9).toUpperCase()}`;
+    const passwordHash = await hashPassword(password);
+
+    await env.DB.prepare(`
+      INSERT INTO members
+        (id, member_code, display_name, status,
+         max_devices, expires_at, password_hash)
+      VALUES (?, ?, ?, 'active', ?, ?, ?)
+    `).bind(
+      id,
+      code,
+      name,
+      maxDevices,
+      body.expires_at || null,
+      passwordHash
+    ).run();
+
+    await audit(env, "member_created", id);
+
+    return json({
+      ok: true,
+      member: {
+        id,
+        member_code: code,
+        display_name: name,
+        status: "active"
+      }
+    }, 201);
+  }
+
+
+  // MEMBER_DELETE_ROUTE_V1
+  const memberDelete = path.match(/^\/admin\/members\/([^/]+)\/delete$/);
+
+  if (method === "POST" && memberDelete) {
+    const id = memberDelete[1];
+
+    const member = await env.DB.prepare(
+      "SELECT id FROM members WHERE id = ? LIMIT 1"
+    ).bind(id).first();
+
+    if (!member) {
+      return json({ ok: false, error: "Member not found" }, 404);
+    }
+
+    await audit(env, "member_deleted", id);
+
+    await env.DB.batch([
+      env.DB.prepare(
+        "DELETE FROM playback_sessions WHERE member_id = ?"
+      ).bind(id),
+      env.DB.prepare(
+        "DELETE FROM broadcast_recipients WHERE member_id = ?"
+      ).bind(id),
+      env.DB.prepare(
+        "DELETE FROM messages WHERE member_id = ?"
+      ).bind(id),
+      env.DB.prepare(
+        "DELETE FROM devices WHERE member_id = ?"
+      ).bind(id),
+      env.DB.prepare(
+        "DELETE FROM members WHERE id = ?"
+      ).bind(id)
+    ]);
+
+    return json({ ok: true, deleted: true });
+  }
+
+  const memberStatus = path.match(/^\/admin\/members\/([^/]+)\/status$/);
+
+  if (method === "PATCH" && memberStatus) {
+    const body = await readJson(request);
+    const status = body?.status;
+
+    if (!["active", "inactive", "blocked"].includes(status)) {
+      return json({ ok: false, error: "Invalid status" }, 400);
+    }
+
+    await env.DB.prepare(`
+      UPDATE members SET status = ? WHERE id = ?
+    `).bind(status, memberStatus[1]).run();
+
+    if (status !== "active") {
+      await env.DB.prepare(`
+        UPDATE playback_sessions
+        SET status = 'revoked'
+        WHERE member_id = ? AND status = 'active'
+      `).bind(memberStatus[1]).run();
+    }
+
+    await audit(env, "member_status_changed", memberStatus[1], { status });
+    return json({ ok: true });
+  }
+
+  if (method === "GET" && path === "/admin/devices") {
+    const result = await env.DB.prepare(`
+      SELECT d.id, d.member_id, d.device_id, d.device_name,
+             d.status, d.paired_at, d.last_seen,
+             m.member_code, m.display_name
+      FROM devices d
+      LEFT JOIN members m ON m.id = d.member_id
+      ORDER BY d.last_seen DESC
+      LIMIT 2000
+    `).all();
+
+    return json({ ok: true, devices: result.results || [] });
+  }
+
+  const deviceStatus = path.match(/^\/admin\/devices\/([^/]+)\/status$/);
+
+  if (method === "PATCH" && deviceStatus) {
+    const body = await readJson(request);
+    const status = body?.status;
+
+    if (!["active", "blocked"].includes(status)) {
+      return json({ ok: false, error: "Invalid status" }, 400);
+    }
+
+    await env.DB.prepare(`
+      UPDATE devices SET status = ? WHERE id = ?
+    `).bind(status, deviceStatus[1]).run();
+
+    if (status === "blocked") {
+      await env.DB.prepare(`
+        UPDATE playback_sessions
+        SET status = 'revoked'
+        WHERE device_id = (
+          SELECT device_id FROM devices WHERE id = ?
+        )
+        AND member_id = (
+          SELECT member_id FROM devices WHERE id = ?
+        )
+        AND status = 'active'
+      `).bind(deviceStatus[1], deviceStatus[1]).run();
+    }
+
+    await audit(env, "device_status_changed", deviceStatus[1], { status });
+    return json({ ok: true });
+  }
+
+  const messageDelete = path.match(/^\/admin\/messages\/([^/]+)\/delete$/);
+  if (method === "POST" && messageDelete) {
+    const id = messageDelete[1];
+
+    const message = await env.DB.prepare(
+      "SELECT id FROM messages WHERE id = ? LIMIT 1"
+    ).bind(id).first();
+
+    if (!message) {
+      return json({ ok: false, error: "Message not found" }, 404);
+    }
+
+    await env.DB.prepare(
+      "DELETE FROM messages WHERE id = ?"
+    ).bind(id).run();
+
+    await audit(env, "message_deleted", id);
+    return json({ ok: true, deleted: true });
+  }
+
+  if (method === "GET" && path === "/admin/messages") {
+    const result = await env.DB.prepare(`
+      SELECT id, member_id, title, body, created_at, expires_at
+      FROM messages
+      ORDER BY created_at DESC
+      LIMIT 1000
+    `).all();
+
+    return json({ ok: true, messages: result.results || [] });
+  }
+
+  if (method === "POST" && path === "/admin/messages") {
+    const body = await readJson(request);
+    if (!body) return json({ ok: false, error: "Invalid JSON" }, 400);
+
+    const title = String(body.title || "").trim();
+    const message = String(body.body || "").trim();
+    const audience = body.audience || (body.member_id ? "selected" : "all");
+
+    if (!title || !message ||
+        title.length > 180 ||
+        message.length > 10000 ||
+        !["all", "selected"].includes(audience)) {
+      return json({ ok: false, error: "Invalid message" }, 400);
+    }
+
+    const expiry = body.expires_at || null;
+    if (expiry && !normalizeExpiry(expiry)) {
+      return json({ ok: false, error: "Invalid expiration date" }, 400);
+    }
+
+    if (audience === "all") {
+      await env.DB.prepare(`
+        INSERT INTO messages (id, member_id, title, body, expires_at)
+        VALUES (?, NULL, ?, ?, ?)
+      `).bind(uuid(), title, message, expiry).run();
+
+      await audit(env, "message_sent_all");
+      return json({ ok: true, audience: "all" }, 201);
+    }
+
+    const ids = Array.isArray(body.member_ids)
+      ? [...new Set(body.member_ids.map(String))]
+      : body.member_id ? [String(body.member_id)] : [];
+
+    if (!ids.length || ids.length > MAX_SELECTED_MEMBERS) {
+      return json({ ok: false, error: "Invalid member selection" }, 400);
+    }
+
+    const placeholders = ids.map(() => "?").join(",");
+    const members = await env.DB.prepare(`
+      SELECT id FROM members
+      WHERE status = 'active' AND id IN (${placeholders})
+    `).bind(...ids).all();
+
+    const validIds = (members.results || []).map(x => x.id);
+    if (!validIds.length) {
+      return json({ ok: false, error: "No active recipients" }, 400);
+    }
+
+    const statements = validIds.map(id =>
+      env.DB.prepare(`
+        INSERT INTO messages (id, member_id, title, body, expires_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).bind(uuid(), id, title, message, expiry)
+    );
+
+    await env.DB.batch(statements);
+    await audit(env, "message_sent_selected", null, {
+      recipient_count: validIds.length
+    });
+
+    return json({
+      ok: true,
+      audience: "selected",
+      recipient_count: validIds.length
+    }, 201);
+  }
+
+  if (method === "POST" && path === "/admin/streams") {
+    const body = await readJson(request);
+    if (!body) return json({ ok: false, error: "Invalid JSON" }, 400);
+
+    const name = String(body.name || "").trim();
+    const sourceUrl = String(body.source_url || "").trim();
+    const sourceType = String(body.source_type || "hls");
+
+    if (!name || name.length > 180 ||
+        !allowedSource(sourceUrl, env) ||
+        !["hls"].includes(sourceType)) {
+      return json({ ok: false, error: "Invalid stream source or host" }, 400);
+    }
+
+    const id = uuid();
+
+    await env.DB.prepare(`
+      INSERT INTO stream_sources
+        (id, name, source_url, source_type, status)
+      VALUES (?, ?, ?, ?, 'active')
+    `).bind(id, name, sourceUrl, sourceType).run();
+
+    await audit(env, "stream_created", id);
+
+    return json({
+      ok: true,
+      stream: { id, name, source_type: sourceType, status: "active" }
+    }, 201);
+  }
+
+  if (method === "GET" && path === "/admin/streams") {
+    const result = await env.DB.prepare(`
+      SELECT id, name, source_type, status, created_at, updated_at
+      FROM stream_sources
+      ORDER BY created_at DESC
+      LIMIT 500
+    `).all();
+
+    return json({ ok: true, streams: result.results || [] });
+  }
+
+  const streamRoute = path.match(/^\/admin\/streams\/([^/]+)$/);
+
+  if (method === "PATCH" && streamRoute) {
+    const body = await readJson(request);
+    const id = streamRoute[1];
+
+    if (body?.status && ["active", "inactive", "blocked"].includes(body.status)) {
+      await env.DB.prepare(`
+        UPDATE stream_sources SET status = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+      `).bind(body.status, id).run();
+
+      await audit(env, "stream_status_changed", id, {
+        status: body.status
+      });
+
+      return json({ ok: true });
+    }
+
+    if (body?.source_url) {
+      const sourceUrl = String(body.source_url);
+      if (!allowedSource(sourceUrl, env)) {
+        return json({ ok: false, error: "Source host not allowed" }, 400);
+      }
+
+      await env.DB.prepare(`
+        UPDATE stream_sources
+        SET source_url = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+      `).bind(sourceUrl, id).run();
+
+      await audit(env, "stream_source_updated", id);
+      return json({ ok: true });
+    }
+
+    return json({ ok: false, error: "No valid update" }, 400);
+  }
+
+  if (method === "POST" && path === "/admin/broadcast/start") {
+    const body = await readJson(request);
+    if (!body) return json({ ok: false, error: "Invalid JSON" }, 400);
+
+    const title = String(body.title || "").trim();
+    const message = String(body.message || "");
+    const streamId = String(body.stream_id || "");
+    const audience = body.audience || "all";
+
+    if (!title || title.length > 180 ||
+        message.length > 5000 ||
+        !streamId ||
+        !["all", "selected"].includes(audience)) {
+      return json({ ok: false, error: "Invalid broadcast" }, 400);
+    }
+
+    const source = await env.DB.prepare(`
+      SELECT id, status FROM stream_sources WHERE id = ? LIMIT 1
+    `).bind(streamId).first();
+
+    if (!source || source.status !== "active") {
+      return json({ ok: false, error: "Stream unavailable" }, 400);
+    }
+
+    const broadcastId = uuid();
+
+    const statements = [
+      env.DB.prepare(`
+        INSERT INTO broadcasts
+          (id, title, message, stream_source_id, audience,
+           status, created_by, started_at)
+        VALUES (?, ?, ?, ?, ?, 'live', 'admin', CURRENT_TIMESTAMP)
+      `).bind(broadcastId, title, message, streamId, audience)
+    ];
+
+    let recipientCount = 0;
+
+    if (audience === "all") {
+      // Yayın başladığı andaki aktif üyeleri sabitle.
+      // Sonradan eklenen üyeler bu yayına otomatik katılamaz.
+      statements.push(env.DB.prepare(`
+        INSERT INTO broadcast_recipients
+          (id, broadcast_id, member_id, status)
+        SELECT lower(hex(randomblob(16))), ?, id, 'targeted'
+        FROM members
+        WHERE status = 'active'
+      `).bind(broadcastId));
+
+      const count = await env.DB.prepare(`
+        SELECT COUNT(*) AS total
+        FROM members
+        WHERE status = 'active'
+      `).first();
+
+      recipientCount = Number(count?.total || 0);
+
+      if (!recipientCount) {
+        return json({ ok: false, error: "No active recipients" }, 400);
+      }
+    } else {
+      const ids = Array.isArray(body.member_ids)
+        ? [...new Set(body.member_ids.map(String))]
+        : [];
+
+      if (!ids.length || ids.length > MAX_SELECTED_MEMBERS) {
+        return json({ ok: false, error: "Invalid recipient selection" }, 400);
+      }
+
+      const placeholders = ids.map(() => "?").join(",");
+      const members = await env.DB.prepare(`
+        SELECT id FROM members
+        WHERE status = 'active' AND id IN (${placeholders})
+      `).bind(...ids).all();
+
+      const validIds = (members.results || []).map(x => x.id);
+
+      if (!validIds.length) {
+        return json({ ok: false, error: "No active recipients" }, 400);
+      }
+
+      recipientCount = validIds.length;
+
+      for (const memberId of validIds) {
+        statements.push(env.DB.prepare(`
+          INSERT INTO broadcast_recipients
+            (id, broadcast_id, member_id, status)
+          VALUES (?, ?, ?, 'targeted')
+        `).bind(uuid(), broadcastId, memberId));
+      }
+    }
+
+    await env.DB.batch(statements);
+    await audit(env, "broadcast_started", broadcastId, {
+      audience,
+      recipient_count: recipientCount
+    });
+
+    return json({
+      ok: true,
+      broadcast_id: broadcastId,
+      audience,
+      recipient_count: audience === "all" ? "all-active-members" : recipientCount
+    }, 201);
+  }
+
+  if (method === "POST" && path === "/admin/broadcast/stop") {
+    const body = await readJson(request);
+    const requestedId = String(body?.broadcast_id || "").trim();
+
+    const active = requestedId
+      ? await env.DB.prepare(`
+          SELECT id FROM broadcasts
+          WHERE id = ? AND status = 'live'
+          LIMIT 1
+        `).bind(requestedId).first()
+      : await env.DB.prepare(`
+          SELECT id FROM broadcasts
+          WHERE status = 'live'
+          ORDER BY started_at DESC, created_at DESC
+          LIMIT 1
+        `).first();
+
+    if (!active) {
+      return json({ ok: false, error: "Aktif yayın bulunamadı." }, 404);
+    }
+
+    const id = active.id;
+
+    await env.DB.batch([
+      env.DB.prepare(`
+        UPDATE broadcasts
+        SET status = 'stopped',
+            stopped_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND status = 'live'
+      `).bind(id),
+
+      env.DB.prepare(`
+        UPDATE playback_sessions
+        SET status = 'revoked'
+        WHERE broadcast_id = ? AND status = 'active'
+      `).bind(id),
+
+      env.DB.prepare(`
+        UPDATE broadcast_recipients
+        SET status = 'ended', ended_at = CURRENT_TIMESTAMP
+        WHERE broadcast_id = ? AND status IN ('targeted', 'authorized')
+      `).bind(id)
+    ]);
+
+    await audit(env, "broadcast_stopped", id);
+    return json({ ok: true, broadcast_id: id, stopped: true });
+  }
+
+  if (method === "GET" && path === "/admin/broadcast") {
+    const result = await env.DB.prepare(`
+      SELECT b.id, b.title, b.message, b.audience, b.status,
+             b.started_at, b.stopped_at, b.created_at,
+             s.name AS stream_name
+      FROM broadcasts b
+      LEFT JOIN stream_sources s ON s.id = b.stream_source_id
+      ORDER BY b.created_at DESC
+      LIMIT 100
+    `).all();
+
+    return json({ ok: true, broadcasts: result.results || [] });
+  }
+
+  if (method === "GET" && path === "/admin/audit") {
+    const result = await env.DB.prepare(`
+      SELECT id, actor_type, actor_id, action,
+             target_type, target_id, details, created_at
+      FROM audit_logs
+      ORDER BY created_at DESC
+      LIMIT 500
+    `).all();
+
+    return json({ ok: true, logs: result.results || [] });
+  }
+
+  return json({ ok: false, error: "Admin endpoint not found" }, 404);
+}
+
+/* =========================================================
+   PRIVATE GITHUB API
+   Token is read only from Worker environment secrets.
+   APK and member responses never receive the token.
+   ========================================================= */
+
+function allowedGithubRepos(env) {
+  return (env.GITHUB_ALLOWED_REPOS || "")
+    .split(",")
+    .map(x => x.trim())
+    .filter(x => /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(x));
+}
+
+function checkGithubRepo(repo, env) {
+  return allowedGithubRepos(env).includes(repo);
+}
+
+function cleanGithubPath(path) {
+  const value = String(path || "").replace(/^\/+/, "");
+
+  if (!value ||
+      value.split("/").some(part =>
+        !part || part === "." || part === ".." ||
+        part.includes("\\")
+      )) return null;
+
+  return value;
+}
+
+function isGithubPathWritable(path) {
+  if (!path) return false;
+
+  const parts = path.split("/").map(x => x.toLowerCase());
+  const filename = parts[parts.length - 1];
+
+  if (parts.some(x => x === ".github" || x === ".git")) {
+    return false;
+  }
+
+  const protectedFiles = new Set([
+    "codeowners",
+    ".gitmodules",
+    "security.md",
+    "dependabot.yml",
+    "dependabot.yaml"
+  ]);
+
+  if (protectedFiles.has(filename)) return false;
+
+  return true;
+}
+
+async function githubRequest(env, path, options = {}) {
+  if (!env.GITHUB_TOKEN) {
+    throw new Error("GitHub token is not configured");
+  }
+
+  const response = await fetch(`https://api.github.com${path}`, {
+    ...options,
+    headers: {
+      "Accept": "application/vnd.github+json",
+      "Authorization": `Bearer ${env.GITHUB_TOKEN}`,
+      "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": "Private-Content-Manager",
+      ...(options.headers || {})
+    }
+  });
+
+  const text = await response.text();
+  let data;
+
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    data = {};
+  }
+
+  if (!response.ok) {
+    throw new Error(`GitHub API error ${response.status}`);
+  }
+
+  return data;
+}
+
+async function handleGithub(request, env, url, method) {
+  if (method === "GET" && url.pathname === "/admin/github/repos") {
+    const repos = [];
+
+    for (const repo of allowedGithubRepos(env)) {
+      try {
+        const info = await githubRequest(env, `/repos/${repo}`);
+        repos.push({
+          name: info.full_name,
+          private: info.private,
+          default_branch: info.default_branch
+        });
+      } catch {
+        repos.push({ name: repo, error: "Repository unavailable" });
+      }
+    }
+
+    return json({ ok: true, repos });
+  }
+
+  if (url.pathname === "/admin/github/file" && method === "GET") {
+    const repo = url.searchParams.get("repo") || "";
+    const path = cleanGithubPath(url.searchParams.get("path"));
+    const ref = url.searchParams.get("ref") || "";
+
+    if (!checkGithubRepo(repo, env) || !path) {
+      return json({ ok: false, error: "Invalid repository or path" }, 400);
+    }
+
+    try {
+      const query = ref ? `?ref=${encodeURIComponent(ref)}` : "";
+      const file = await githubRequest(
+        env,
+        `/repos/${repo}/contents/${path.split("/").map(encodeURIComponent).join("/")}${query}`
+      );
+
+      if (Array.isArray(file) || file.type !== "file" || !file.content) {
+        return json({ ok: false, error: "Not a regular file" }, 400);
+      }
+
+      const content = decoder.decode(unb64url(
+        b64url(Uint8Array.from(atob(file.content.replace(/\n/g, "")), c => c.charCodeAt(0)))
+      ));
+
+      return json({
+        ok: true,
+        repository: repo,
+        path,
+        sha: file.sha,
+        size: file.size,
+        content
+      });
+    } catch {
+      return json({ ok: false, error: "GitHub file read failed" }, 502);
+    }
+  }
+
+  if (url.pathname === "/admin/github/chunk" && method === "PUT") {
+    const body = await readJson(request);
+    if (!body) return json({ ok: false, error: "Invalid JSON" }, 400);
+
+    const repo = String(body.repo || "");
+    const path = cleanGithubPath(body.path);
+    const contentBase64 = String(body.contentBase64 || "");
+    const message = String(body.message || "Upload file part");
+
+    if (!checkGithubRepo(repo, env) ||
+        !path ||
+        !isGithubPathWritable(path) ||
+        !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(contentBase64) ||
+        Math.floor(contentBase64.length * 3 / 4) > MAX_GITHUB_CHUNK_BYTES) {
+      return json({ ok: false, error: "Invalid chunk or size" }, 400);
+    }
+
+    try {
+      const encodedPath = path.split("/").map(encodeURIComponent).join("/");
+      let sha;
+
+      try {
+        const existing = await githubRequest(
+          env,
+          `/repos/${repo}/contents/${encodedPath}`
+        );
+        sha = existing.sha;
+      } catch {
+        sha = undefined;
+      }
+
+      const payload = { message, content: contentBase64 };
+      if (sha) payload.sha = sha;
+
+      const result = await githubRequest(
+        env,
+        `/repos/${repo}/contents/${encodedPath}`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        }
+      );
+
+      await audit(env, "github_chunk_uploaded", path, { repo });
+
+      return json({
+        ok: true,
+        repository: repo,
+        path,
+        sha: result.content?.sha || null
+      });
+    } catch {
+      return json({ ok: false, error: "GitHub part upload failed" }, 502);
+    }
+  }
+
+  if (url.pathname === "/admin/github/file" && method === "PUT") {
+    const body = await readJson(request);
+    if (!body) return json({ ok: false, error: "Invalid JSON" }, 400);
+
+    const repo = String(body.repo || "");
+    const path = cleanGithubPath(body.path);
+    const content = String(body.content ?? "");
+    const message = String(body.message || "Update managed content");
+
+    if (!checkGithubRepo(repo, env) ||
+        !path ||
+        !isGithubPathWritable(path) ||
+        encoder.encode(content).length > MAX_GITHUB_FILE_BYTES) {
+      return json({ ok: false, error: "Invalid repository, protected path or file size" }, 400);
+    }
+
+    try {
+      const encodedPath = path.split("/").map(encodeURIComponent).join("/");
+      let sha;
+
+      try {
+        const existing = await githubRequest(
+          env,
+          `/repos/${repo}/contents/${encodedPath}`
+        );
+        sha = existing.sha;
+      } catch {
+        sha = undefined;
+      }
+
+      const payload = {
+        message,
+        content: btoa(Array.from(
+          encoder.encode(content),
+          byte => String.fromCharCode(byte)
+        ).join(""))
+      };
+
+      if (sha) payload.sha = sha;
+      // GitHub API varsayılan branch'i kullanır.
+      // İstemciden branch seçimi kabul edilmez.
+
+      const result = await githubRequest(
+        env,
+        `/repos/${repo}/contents/${encodedPath}`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        }
+      );
+
+      await audit(env, "github_file_updated", path, { repo });
+
+      return json({
+        ok: true,
+        repository: repo,
+        path,
+        sha: result.content?.sha || null
+      });
+    } catch {
+      return json({ ok: false, error: "GitHub file update failed" }, 502);
+    }
+  }
+
+  return json({ ok: false, error: "GitHub endpoint not found" }, 404);
+}
+
+/* =========================================================
+   MEMBER API
+   ========================================================= */
+
+async function handleMember(request, env, path, method, auth) {
+  const member = auth.member;
+
+  if (method === "GET" && path === "/member/profile") {
+    return json({
+      ok: true,
+      member: {
+        id: member.id,
+        member_code: member.member_code,
+        display_name: member.display_name,
+        status: member.status,
+        expires_at: member.expires_at,
+        max_devices: member.max_devices
+      }
+    });
+  }
+
+  if (method === "GET" && path === "/member/messages") {
+    const result = await env.DB.prepare(`
+      SELECT id, title, body, created_at, expires_at
+      FROM messages
+      WHERE (member_id IS NULL OR member_id = ?)
+        AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)
+      ORDER BY created_at DESC
+      LIMIT 100
+    `).bind(member.id).all();
+
+    return json({ ok: true, messages: result.results || [] });
+  }
+
+  if (method === "GET" && path === "/member/streams") {
+    const result = await env.DB.prepare(`
+      SELECT id, name, source_type
+      FROM stream_sources
+      WHERE status = 'active'
+      ORDER BY name
+      LIMIT 500
+    `).all();
+
+    return json({ ok: true, streams: result.results || [] });
+  }
+
+  if (method === "GET" && path === "/member/broadcast") {
+    const result = await env.DB.prepare(`
+      SELECT b.id, b.title, b.message, b.started_at,
+             s.name AS stream_name
+      FROM broadcasts b
+      JOIN stream_sources s ON s.id = b.stream_source_id
+      WHERE b.status = 'live'
+        AND s.status = 'active'
+        AND EXISTS (
+          SELECT 1
+          FROM broadcast_recipients r
+          WHERE r.broadcast_id = b.id
+            AND r.member_id = ?
+            AND r.status IN ('targeted', 'authorized')
+        )
+      ORDER BY b.started_at DESC
+      LIMIT 20
+    `).bind(member.id).all();
+
+    return json({ ok: true, broadcasts: result.results || [] });
+  }
+
+  if (method === "POST" && path === "/member/playback") {
+    const body = await readJson(request);
+    if (!body) return json({ ok: false, error: "Invalid JSON" }, 400);
+
+    if (!body.broadcast_id) {
+      return json({
+        ok: false,
+        error: "An active broadcast is required"
+      }, 400);
+    }
+
+    let source;
+    const broadcastId = String(body.broadcast_id).trim();
+
+    if (!broadcastId || broadcastId.length > 180) {
+      return json({ ok: false, error: "Invalid broadcast ID" }, 400);
+    }
+
+    {
+
+      const broadcast = await env.DB.prepare(`
+        SELECT b.id, b.stream_source_id, b.audience,
+               s.id AS source_id, s.source_url, s.status AS source_status
+        FROM broadcasts b
+        JOIN stream_sources s ON s.id = b.stream_source_id
+        WHERE b.id = ? AND b.status = 'live'
+        LIMIT 1
+      `).bind(broadcastId).first();
+
+      if (!broadcast || broadcast.source_status !== "active") {
+        return json({ ok: false, error: "Broadcast unavailable" }, 404);
+      }
+
+      const recipient = await env.DB.prepare(`
+        SELECT id
+        FROM broadcast_recipients
+        WHERE broadcast_id = ?
+          AND member_id = ?
+          AND status IN ('targeted', 'authorized')
+        LIMIT 1
+      `).bind(broadcastId, member.id).first();
+
+      if (!recipient) {
+        return json({ ok: false, error: "Not authorized for broadcast" }, 403);
+      }
+
+      await env.DB.prepare(`
+        UPDATE broadcast_recipients
+        SET status = 'authorized', authorized_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+      `).bind(recipient.id).run();
+
+      source = {
+        id: broadcast.source_id,
+        source_url: broadcast.source_url,
+        status: broadcast.source_status
+      };
+    }
+
+    if (!source) {
+      return json({ ok: false, error: "Stream not found" }, 404);
+    }
+
+    const playback = await issuePlayback(
+      env,
+      member,
+      auth.deviceId,
+      source,
+      broadcastId
+    );
+
+    if (playback.error) {
+      return json({ ok: false, error: playback.error }, 403);
+    }
+
+    return json({ ok: true, ...playback });
+  }
+
+  return json({ ok: false, error: "Member endpoint not found" }, 404);
+}
+
+/* =========================================================
+   MAIN ROUTER
+   ========================================================= */
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const method = request.method.toUpperCase();
+
+    const configuredOrigins = (env.APP_ORIGINS || "")
+      .split(",")
+      .map(x => x.trim())
+      .filter(Boolean);
+
+    const origin = request.headers.get("Origin") || "";
+    const allowOrigin = configuredOrigins.length
+      ? (configuredOrigins.includes(origin) ? origin : "")
+      : "*";
+
+    const cors = {
+      "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, OPTIONS",
+      "Access-Control-Allow-Headers": "Authorization, Content-Type, Range",
+      "Access-Control-Expose-Headers": "Content-Length, Content-Range, Accept-Ranges",
+      "Vary": "Origin"
+    };
+
+    if (allowOrigin) cors["Access-Control-Allow-Origin"] = allowOrigin;
+
+    if (method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: cors
+      });
+    }
+
+    try {
+      if (path === "/health" && method === "GET") {
+        return json({
+          ok: true,
+          version: VERSION,
+          service: "stream-access-service"
+        }, 200, cors);
+      }
+
+      if (path.startsWith("/play/") && method === "GET") {
+        const ticket = path.slice("/play/".length);
+        return proxyMedia(request, env, ticket, cors);
+      }
+
+      if (path.startsWith("/p/") && method === "GET") {
+        const ticket = path.slice("/p/".length);
+        return proxyMedia(request, env, ticket, cors);
+      }
+
+      if (path.startsWith("/auth/") && method === "POST") {
+        return handleLogin(request, env, path);
+      }
+
+      if (path.startsWith("/admin/")) {
+        const admin = await adminAuth(request, env);
+        if (!admin) {
+          return json({ ok: false, error: "Unauthorized" }, 401, cors);
+        }
+
+        if (path.startsWith("/admin/github/")) {
+          return handleGithub(request, env, url, method);
+        }
+
+        return handleAdmin(request, env, path, method);
+      }
+
+      if (path.startsWith("/member/")) {
+        const auth = await memberAuth(request, env);
+        if (!auth) {
+          return json({ ok: false, error: "Unauthorized" }, 401, cors);
+        }
+
+        return handleMember(request, env, path, method, auth);
+      }
+
+      return json({ ok: false, error: "Not found" }, 404, cors);
+    } catch (error) {
+      // Safe diagnostics: never log request bodies, passwords or tokens.
+      console.error("WORKER_REQUEST_ERROR", JSON.stringify({
+        path,
+        method,
+        name: error?.name || "Error",
+        message: String(error?.message || error).slice(0, 1000)
+      }));
+
+      return json({
+        ok: false,
+        error: "Internal server error"
+      }, 500, cors);
+    }
+  }
+};
+
+
+
+===========================================================================
+DOSYA: src/playback-guard.js
+===========================================================================
+
+const encoder = new TextEncoder();
+
+export class PlaybackGuard {
+  constructor(ctx, env) {
+    this.ctx = ctx;
+    this.env = env;
+  }
+
+  async fetch(request) {
+    if (request.method !== "POST") {
+      return this.reply({ ok: false }, 405);
+    }
+
+    const supplied = request.headers.get("X-Guard-Secret") || "";
+    const expected = this.env.PLAYBACK_GUARD_SECRET || "";
+
+    if (
+      expected.length < 32 ||
+      supplied.length !== expected.length ||
+      !constantTimeEqual(supplied, expected)
+    ) {
+      return this.reply({ ok: false }, 403);
+    }
+
+    const path = new URL(request.url).pathname;
+
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return this.reply({ ok: false }, 400);
+    }
+
+    const sid = String(body.sid || "");
+
+    if (!sid || sid.length > 128) {
+      return this.reply({ ok: false }, 400);
+    }
+
+    const key = `session:${sid}`;
+
+    if (path === "/internal/session") {
+      const exp = Number(body.exp);
+
+      if (!Number.isSafeInteger(exp) || exp <= nowSeconds()) {
+        return this.reply({ ok: false, error: "Invalid expiry" }, 400);
+      }
+
+      const memberId = String(body.member_id || "");
+      const deviceId = String(body.device_id || "");
+      const existing = await this.ctx.storage.get(key);
+
+      if (!memberId || !deviceId) {
+        return this.reply({ ok: false, error: "Invalid session identity" }, 400);
+      }
+
+      // İptal edilmiş oturum hiçbir zaman yeniden etkinleştirilemez.
+      if (existing?.status === "revoked") {
+        return this.reply({ ok: false, error: "Session already revoked" }, 409);
+      }
+
+      if (existing?.status === "active") {
+        if (
+          existing.member_id !== memberId ||
+          existing.device_id !== deviceId
+        ) {
+          return this.reply({ ok: false, error: "Session identity mismatch" }, 409);
+        }
+
+        return this.reply({ ok: true, existing: true });
+      }
+
+      await this.ctx.storage.put(key, {
+        sid,
+        member_id: memberId,
+        device_id: deviceId,
+        broadcast_id: body.broadcast_id
+          ? String(body.broadcast_id)
+          : null,
+        exp,
+        status: "active"
+      });
+
+      return this.reply({ ok: true });
+    }
+
+    if (path === "/internal/check") {
+      const session = await this.ctx.storage.get(key);
+
+      if (
+        !session ||
+        session.status !== "active" ||
+        session.exp <= nowSeconds() ||
+        session.member_id !== String(body.member_id || "") ||
+        session.device_id !== String(body.device_id || "") ||
+        (session.broadcast_id || null) !==
+          (body.broadcast_id ? String(body.broadcast_id) : null)
+      ) {
+        return this.reply({ ok: false, active: false }, 403);
+      }
+
+      return this.reply({ ok: true, active: true });
+    }
+
+    if (path === "/internal/revoke") {
+      const session = await this.ctx.storage.get(key);
+
+      if (session) {
+        session.status = "revoked";
+        session.revoked_at = nowSeconds();
+        await this.ctx.storage.put(key, session);
+      } else {
+        await this.ctx.storage.put(key, {
+          sid,
+          status: "revoked",
+          revoked_at: nowSeconds(),
+          exp: nowSeconds() + 86400
+        });
+      }
+
+      return this.reply({ ok: true, revoked: true });
+    }
+
+    return this.reply({ ok: false }, 404);
+  }
+
+  reply(data, status = 200) {
+    return Response.json(data, {
+      status,
+      headers: {
+        "Cache-Control": "no-store",
+        "Content-Type": "application/json"
+      }
+    });
+  }
+}
+
+function nowSeconds() {
+  return Math.floor(Date.now() / 1000);
+}
+
+function constantTimeEqual(a, b) {
+  const aa = encoder.encode(a);
+  const bb = encoder.encode(b);
+
+  let diff = aa.length ^ bb.length;
+  const length = Math.max(aa.length, bb.length);
+
+  for (let i = 0; i < length; i++) {
+    diff |= (aa[i] || 0) ^ (bb[i] || 0);
+  }
+
+  return diff === 0;
+}
+
+
+
+===========================================================================
+DOSYA: wrangler.toml
+===========================================================================
+
+name = "stream-access-service"
+main = "src/index.js"
+compatibility_date = "2026-11-02"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "isa-admin-prod-db"
+database_id = "36c92973-5128-4cf0-8420-736a607a65b8"
+migrations_dir = "migrations"
+
+[vars]
+PLAYBACK_TICKET_TTL = "1800"
+
+[[durable_objects.bindings]]
+name = "PLAYBACK_GUARD"
+class_name = "PlaybackGuard"
+
+[[migrations]]
+tag = "playback-guard-v1"
+new_sqlite_classes = ["PlaybackGuard"]
+
+
+
+===========================================================================
+DOSYA: wrangler.toml.before-guard
+===========================================================================
+
+name = "stream-access-service"
+main = "src/index.js"
+compatibility_date = "2026-11-02"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "isa-admin-prod-db"
+database_id = "36c92973-5128-4cf0-8420-736a607a65b8"
+migrations_dir = "migrations"
+
+[vars]
+PLAYBACK_TICKET_TTL = "1800"
+
