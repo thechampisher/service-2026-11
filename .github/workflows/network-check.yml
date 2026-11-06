@@ -12,20 +12,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check catalog connectivity
+      - name: Read complete Turkey catalog
         run: |
           python3 - <<'PY'
-          import json, time, urllib.request, urllib.error
+          import json, time, urllib.request, gzip, os
 
-          now = int(time.time() * 1000)
-          lang = "de"
+          LANG = "de"
+          NOW = int(time.time() * 1000)
 
           ping = {
               "reason": "app-focus",
-              "locale": lang,
+              "locale": LANG,
               "theme": "dark",
               "metadata": {
-                  "device": {"type": "desktop", "uniqueId": f"gh-{now}"},
+                  "device": {"type": "desktop", "uniqueId": f"gh-{NOW}"},
                   "os": {"name": "linux", "version": "Linux", "abis": ["x64"], "host": "node"},
                   "app": {"platform": "electron"},
                   "version": {"package": "tv.vavoo.app", "binary": "3.1.8", "js": "3.1.8"}
@@ -39,8 +39,8 @@ jobs:
               "package": "tv.vavoo.app",
               "version": "3.1.8",
               "process": "app",
-              "firstAppStart": now,
-              "lastAppStart": now,
+              "firstAppStart": NOW,
+              "lastAppStart": NOW,
               "ipLocation": None,
               "adblockEnabled": True,
               "proxy": {"supported": ["ss"], "engine": "Mu", "enabled": False, "autoServer": True},
@@ -54,64 +54,146 @@ jobs:
                   headers=headers,
                   method="POST"
               )
-              with urllib.request.urlopen(req, timeout=30) as response:
+              with urllib.request.urlopen(req, timeout=35) as response:
                   raw = response.read()
-                  return response.status, raw
+                  if raw[:2] == b"\x1f\x8b":
+                      raw = gzip.decompress(raw)
+                  return json.loads(raw)
 
-          try:
-              status, raw = post(
-                  "https://www.vavoo.tv/api/app/ping",
-                  ping,
-                  {
-                      "Content-Type": "application/json",
-                      "User-Agent": "MediaHubMX/2",
-                      "Accept": "*/*"
-                  }
-              )
-              signature = json.loads(raw).get("addonSig")
-              print("PING:", status, "SIGNATURE:", "OK" if signature else "MISSING")
-
-              if not signature:
-                  raise RuntimeError("Signature missing")
-
-              headers = {
-                  "Content-Type": "application/json; charset=utf-8",
-                  "mediahubmx-signature": signature,
+          print("Vavoo imzası alınıyor...")
+          signature_data = post(
+              "https://www.vavoo.tv/api/app/ping",
+              ping,
+              {
+                  "Content-Type": "application/json",
                   "User-Agent": "MediaHubMX/2",
-                  "Accept": "*/*",
-                  "Accept-Language": lang,
-                  "Connection": "close"
+                  "Accept": "*/*"
               }
+          )
 
-              payload = {
-                  "language": lang,
-                  "region": "TR",
-                  "catalogId": "iptv",
-                  "id": "iptv",
-                  "adult": False,
-                  "search": "",
-                  "sort": "",
-                  "filter": {},
-                  "cursor": None,
-                  "clientVersion": "3.0.2"
-              }
+          signature = signature_data.get("addonSig")
+          if not signature:
+              raise RuntimeError("Vavoo imzası alınamadı")
 
-              for host in ("vavoo.to", "kool.to"):
-                  url = f"https://{host}/mediahubmx-catalog.json"
-                  print("\nHOST:", host)
-                  try:
-                      status, raw = post(url, payload, headers)
-                      data = json.loads(raw)
+          headers = {
+              "Content-Type": "application/json; charset=utf-8",
+              "mediahubmx-signature": signature,
+              "User-Agent": "MediaHubMX/2",
+              "Accept": "*/*",
+              "Accept-Language": LANG
+          }
+
+          hosts = ["vavoo.to", "kool.to"]
+          result = None
+
+          for host in hosts:
+              print(f"\nKatalog sunucusu: {host}")
+              try:
+                  cursor = None
+                  seen_cursors = set()
+                  channels = {}
+                  pages = 0
+
+                  while True:
+                      payload = {
+                          "language": LANG,
+                          "region": "TR",
+                          "catalogId": "iptv",
+                          "id": "iptv",
+                          "adult": False,
+                          "search": "",
+                          "sort": "",
+                          "filter": {},
+                          "cursor": cursor,
+                          "clientVersion": "3.0.2"
+                      }
+
+                      data = post(
+                          f"https://{host}/mediahubmx-catalog.json",
+                          payload,
+                          headers
+                      )
+
+                      pages += 1
                       items = data.get("items", [])
-                      print("HTTP:", status)
-                      print("ITEMS:", len(items))
-                      print("NEXT PAGE:", bool(data.get("nextCursor")))
-                      groups = sorted(set(str(x.get("group", "")) for x in items))
-                      print("GROUPS:", json.dumps(groups[:80], ensure_ascii=False))
-                  except Exception as error:
-                      print("FAILED:", type(error).__name__, str(error)[:250])
 
-          except Exception as error:
-              print("PING FAILED:", type(error).__name__, str(error)[:250])
-              raise
+                      for item in items:
+                          if item.get("type") != "iptv":
+                              continue
+
+                          group = str(item.get("group", "")).strip().lower()
+                          if group not in ("turkey", "türkiye", "turkiye"):
+                              continue
+
+                          channel_id = str(item.get("id") or item.get("url") or "")
+                          if not channel_id:
+                              continue
+
+                          channels[channel_id] = {
+                              "id": channel_id,
+                              "name": str(item.get("name", "")).strip(),
+                              "group": str(item.get("group", ""))
+                          }
+
+                      print(
+                          f"Sayfa {pages}: {len(items)} kayıt, "
+                          f"Türkiye toplam {len(channels)}"
+                      )
+
+                      next_cursor = data.get("nextCursor")
+                      if not next_cursor:
+                          break
+
+                      cursor_key = json.dumps(
+                          next_cursor, sort_keys=True, ensure_ascii=False
+                      )
+
+                      if cursor_key in seen_cursors:
+                          raise RuntimeError("Tekrarlanan sayfalama imleci")
+                      seen_cursors.add(cursor_key)
+
+                      if pages >= 100:
+                          raise RuntimeError("100 sayfa sınırına ulaşıldı")
+
+                      cursor = next_cursor
+
+                  result = {
+                      "host": host,
+                      "pages": pages,
+                      "count": len(channels),
+                      "channels": sorted(
+                          channels.values(),
+                          key=lambda x: x["name"].casefold()
+                      )
+                  }
+                  break
+
+              except Exception as error:
+                  print("Sunucu hatası:", type(error).__name__, str(error)[:250])
+
+          if result is None:
+              raise RuntimeError("İki katalog sunucusu da başarısız")
+
+          print("\n===== TÜRKİYE KATALOG SONUCU =====")
+          print("Sunucu:", result["host"])
+          print("Sayfa:", result["pages"])
+          print("Toplam kanal:", result["count"])
+
+          summary = os.environ["GITHUB_STEP_SUMMARY"]
+          with open(summary, "a", encoding="utf-8") as f:
+              f.write("# Türkiye kanal kataloğu\n\n")
+              f.write(f"- Sunucu: `{result['host']}`\n")
+              f.write(f"- Sayfa: **{result['pages']}**\n")
+              f.write(f"- Toplam kanal: **{result['count']}**\n\n")
+              f.write("| # | Kanal adı | Grup |\n|---:|---|---|\n")
+
+              for index, channel in enumerate(result["channels"], 1):
+                  name = channel["name"].replace("|", "\\|")
+                  group = channel["group"].replace("|", "\\|")
+                  f.write(f"| {index} | {name} | {group} |\n")
+
+          print("\nKanal listesi GitHub Actions Summary bölümüne yazıldı.")
+
+          if not result["count"]:
+              raise RuntimeError("Türkiye kanal listesi boş")
           PY
